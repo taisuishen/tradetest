@@ -96,12 +96,15 @@ python trader15.py report    # 胜率、利润、持仓、最近成交
 
 > 马丁分批挂单的 60 天回测胜率 89–93%，但净亏 −741U。高胜率不代表赚钱，详见 `backtest.py`。
 
-## 部署到 Linux 服务器
+## 部署到 Linux 服务器（CentOS 7/8/9、Rocky、Alma、Ubuntu、Debian）
 
 ```bash
-git clone https://github.com/taisuishen/tradetest.git && cd tradetest
+cd /opt && git clone https://github.com/taisuishen/tradetest.git && cd tradetest
 sudo bash deploy/install.sh 8080
 ```
 
-装好后每 5 分钟自动运行一次。看板地址是 `http://服务器IP:8080/`，需要在云厂商安全组放行 8080 端口。
-服务器需要能访问 www.okx.com：美国 IP 可能被 OKX 限制，建议用香港、新加坡或日本的机房。
+- 安装脚本会自动找 Python 3.9 及以上版本；找不到时，CentOS 8/9 用 dnf 安装 python3.11，CentOS 7 用 uv 下载独立的 Python 3.11。
+- firewalld 在运行时，脚本会自动放行看板端口；云厂商的安全组需要另外手动放行。
+- 看板地址是 `http://服务器IP:8080/`。看板没有登录密码，建议安全组只允许自己的 IP 访问。
+- 建议装在 `/opt` 下：SELinux 开启时，放在家目录里可能被拦截。
+- 服务器需要能访问 www.okx.com：美国 IP 可能被 OKX 限制，建议用香港、新加坡或日本的机房。

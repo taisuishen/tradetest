@@ -66,6 +66,22 @@ def main():
     if r is not None and r.stdout.strip() != "active":
         r2 = systemctl("restart", "paper-dashboard.service")
         wlog(f"看板服务状态 {r.stdout.strip()}，已重启：{'成功' if r2 and r2.returncode == 0 else '失败'}")
+    if os.name == "nt":
+        ensure_windows_dashboard(cfg.get("dashboard_port", 8080))
+
+
+def ensure_windows_dashboard(port):
+    """Windows：本机看板（只监听 127.0.0.1）没在运行就后台拉起。"""
+    import socket
+    with socket.socket() as s:
+        s.settimeout(2)
+        if s.connect_ex(("127.0.0.1", port)) == 0:
+            return
+    pyw = Path(sys.executable).with_name("pythonw.exe")
+    subprocess.Popen([str(pyw if pyw.exists() else sys.executable), "-m", "http.server", str(port), "--bind", "127.0.0.1",
+                      "--directory", str(ROOT / "web")], cwd=ROOT, creationflags=0x00000008 | 0x00000200,  # DETACHED | NEW_GROUP
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wlog(f"本机看板未运行，已在 http://127.0.0.1:{port}/ 启动")
 
 
 if __name__ == "__main__":
