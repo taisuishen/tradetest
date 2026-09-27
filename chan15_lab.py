@@ -75,7 +75,7 @@ def precompute(inst, days):
     with ProcessPoolExecutor(w, initializer=_init, initargs=({"df15": df15, "df1h": df1h, "df4h": df4h},)) as ex:
         p15 = dict(ex.map(task15, Ts, chunksize=40))
         p1h = dict(ex.map(task1h, Th, chunksize=10))
-    return Ts, p15, p1h, list(zip(df5.ts.astype("int64"), df5.h, df5.l))
+    return Ts, p15, p1h, list(zip(df5.ts.astype("int64"), df5.h, df5.l, df5.c))
 
 
 def simulate(Ts, p15, p1h, b5, unit, v, fee=2.0, fm=None):
@@ -86,6 +86,8 @@ def simulate(Ts, p15, p1h, b5, unit, v, fee=2.0, fm=None):
     part_r / part_frac 到几倍风险先平掉多少比例，part_be 分批后剩余仓位是否移到保本
     fm：真实费用模型 {"taker": 吃单费率, "funding": [(结算时间, 费率)]}；为 None 时每 1 倍固定扣 fee"""
     trades, pos, used, j = [], None, set(), 0
+    delay = v.get("entry_delay_5m", 0)                     # 发现信号比 15m 收盘晚几根 5m（模拟扫描频率的影响）
+    c5 = {b[0]: b[3] for b in b5} if delay else {}
     for T in Ts:
         info = p15.get(T)
         if not info:
@@ -133,7 +135,9 @@ def simulate(Ts, p15, p1h, b5, unit, v, fee=2.0, fm=None):
                     continue
                 if v.get("eff1h_min") and (not hr or hr["eff1h"] < v["eff1h_min"]):
                     continue
-                entry = info["close"]
+                entry = info["close"] if not delay else c5.get(T + (delay - 1) * 300_000)
+                if entry is None:
+                    continue
                 stop = px - side * v["stop_buf"] * info["atr"]
                 if (stop - entry) * side >= 0:
                     continue                                  # 价格已回到买卖点另一侧，结构失效
@@ -143,7 +147,7 @@ def simulate(Ts, p15, p1h, b5, unit, v, fee=2.0, fm=None):
                 mult = size_from_score(score, v.get("sizing")) if v.get("sizing") else v.get("fixed_mult", 1.0)
                 pos = {"side": side, "type": t, "entry": entry, "stop": stop, "tp": tp, "ts": T, "risk": risk,
                        "score": score, "mult": mult, "fm": fm,
-                       "rem": 1.0, "realized": 0.0, "be_done": False, "part_done": False}
+                       "rem": 1.0, "realized": 0.0, "be_done": False, "part_done": False, "active_from": T + delay * 300_000}
                 break
         if not pos:
             continue
@@ -152,7 +156,10 @@ def simulate(Ts, p15, p1h, b5, unit, v, fee=2.0, fm=None):
             j += 1
         k = j
         while k < len(b5) and b5[k][0] < T + M15:
-            ts_, h, l = b5[k]
+            ts_, h, l = b5[k][:3]
+            if ts_ < pos.get("active_from", 0):              # 延迟入场前的 K 线不算
+                k += 1
+                continue
             s = pos["side"]
             best = h if s > 0 else l
             if (l <= pos["stop"]) if s > 0 else (h >= pos["stop"]):

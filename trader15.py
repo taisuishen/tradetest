@@ -13,7 +13,9 @@
   费用：交易手续费 = 成交金额 × OKX 吃单费率（开平各一次；配置只读 API Key 时用账户真实费率，否则 Lv1 标准 0.05%），
         另加持仓期间 OKX 实际资金费（fees.py）；fee_mode=fixed 可改回每 1 倍固定 2U
 
-用法：python trader15.py run | report
+用法：python trader15.py loop     常驻：算完一轮马上接着算（部署默认方式）
+      python trader15.py run      只跑一轮
+      python trader15.py report   统计
 """
 import json
 import logging
@@ -44,6 +46,7 @@ DEFAULT_CFG = {
     "trend_threshold": 1.0,
     "nest_filter": True,
     "min_trend_eff_1h": 0.25,  # 1H 趋势效率下限，0 表示不过滤
+    "loop_interval_sec": 1,    # 常驻模式两轮之间的最短间隔（秒），0 表示算完马上接着算
     "sizing": "step",          # 动态仓位：step=按评分分档 0.5/1/2/3/5 倍，linear=0.5~5 倍线性，""=固定 1 倍（见 sizing.py）
     "stop_buffer_atr": 0.5,
     "fresh_bars": 3,            # 买卖点确认后多少根 15m 内还算“新”
@@ -89,6 +92,8 @@ def db():
         last_checked_ts integer, context text, funding real default 0);
     create table if not exists used_points(inst text, type text, ts integer, primary key(inst, type, ts));
     create table if not exists signals(ts integer, inst text, price real, decision text, detail text);
+    create index if not exists idx_signals_inst_ts on signals(inst, ts);
+    create index if not exists idx_signals_ts on signals(ts);
     """)
     if "funding" not in [r[1] for r in con.execute("pragma table_info(trades)")]:   # 旧库升级
         con.execute("alter table trades add column funding real default 0"); con.commit()
@@ -103,7 +108,14 @@ def bj(ts):
     return datetime.fromtimestamp(ts / 1000, TZ).strftime("%m-%d %H:%M") if ts else "-"
 
 
+QUIET = {"观望", "持仓", "放弃"}   # 每分钟都在重复的状态：同类记录最多 5 分钟记一条，免得刷屏
+
+
 def signal(con, inst, price, decision, detail):
+    if decision in QUIET:
+        last = con.execute("select ts, decision, detail from signals where inst=? order by ts desc limit 1", (inst,)).fetchone()
+        if last and last["decision"] == decision and now_ms() - last["ts"] < 300_000 and (decision != "放弃" or last["detail"] == detail):
+            return
     con.execute("insert into signals values(?,?,?,?,?)", (now_ms(), inst, price, decision, detail)); con.commit()
     log.info(f"[{inst}] {decision}：{detail}")
     if decision in ("开仓", "平仓") and _CFG.get("alert_trades"):
@@ -111,6 +123,8 @@ def signal(con, inst, price, decision, detail):
 
 
 _CFG = {}
+_MODE = {}
+_LAST_DASH = [0.0]
 
 
 def alert(cfg, text):
@@ -137,7 +151,10 @@ def read_heartbeat():
 def write_heartbeat(ok, err=None):
     hb = read_heartbeat()
     now = now_ms()
+    import os
     hb["last_run_ts"] = now
+    hb["pid"] = os.getpid()
+    hb["mode"] = "loop" if _MODE.get("loop") else "once"
     if ok:
         hb["last_ok_ts"] = now
         hb["consecutive_errors"] = 0
@@ -289,10 +306,14 @@ def run_once():
         alert(cfg, f"已连续 {n} 次运行失败：{hb['last_error']}")
     if not errors and prev.get("consecutive_errors", 0) >= n:
         alert(cfg, f"已恢复正常（此前连续失败 {prev['consecutive_errors']} 次）")
-    try:
-        write_dashboard(con, cfg)
-    except Exception as e:
-        log.error(f"看板生成失败：{e}")
+    # 常驻模式下看板最多每 10 秒重写一次（有开平仓时立即重写）
+    traded = con.execute("select count(*) from signals where ts>? and decision in ('开仓','平仓')", (now_ms() - 15_000,)).fetchone()[0]
+    if not _MODE.get("loop") or traded or time.time() - _LAST_DASH[0] >= 10:
+        try:
+            write_dashboard(con, cfg)
+            _LAST_DASH[0] = time.time()
+        except Exception as e:
+            log.error(f"看板生成失败：{e}")
     con.close()
 
 
@@ -368,7 +389,7 @@ def write_dashboard(con, cfg):
               f'{"⚠️ 最近连续 " + str(ce) + " 次运行失败：" + hb.get("last_error", "") if ce else "● 运行正常"}'
               f'｜最后成功运行 {bj(hb.get("last_ok_ts"))}</div>'
               '<script>(function(){var e=document.getElementById("health");var m=(Date.now()-(+e.dataset.ts))/60000;'
-              'if(m>15){e.className="bad";e.textContent="⚠️ 看板已 "+Math.round(m)+" 分钟没有更新，程序可能已停止（正常每 5 分钟更新一次）";}})();</script>')
+              'if(m>5){e.className="bad";e.textContent="⚠️ 看板已 "+Math.round(m)+" 分钟没有更新，程序可能已停止（正常每 10 秒更新一次）";}})();</script>')
     html = f"""<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>缠论模拟交易看板</title>
 <style>
@@ -387,7 +408,7 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
 <h1>15 分钟级缠论模拟交易</h1>
 {health}
 <div class="muted">只模拟，不下真实单｜15m 三买 / 三卖入场，区间套（1H 缠论）+ 大方向 + 只做趋势（1H 趋势效率≥{cfg['min_trend_eff_1h']:.0%}）｜按强弱动态 0.5~5 倍｜止损在买卖点外 0.5 ATR，反向买卖点离场｜
-{fee_desc}，不计滑点｜每 5 分钟运行｜开始于 {bj(first)}｜更新于 {datetime.now(TZ):%m-%d %H:%M:%S}</div>
+{fee_desc}，不计滑点｜常驻循环实时扫描｜开始于 {bj(first)}｜更新于 {datetime.now(TZ):%m-%d %H:%M:%S}</div>
 <div class="grid">
 <div class="kpi"><span>胜率</span><b>{s['wr']:.1f}%</b><span>{s['w']} 胜 / {s['l']} 负</span></div>
 <div class="kpi"><span>净利润</span><b>{money(s['net'])} U</b><span>毛利 {s['gross']:+.2f}</span></div>
@@ -416,7 +437,8 @@ def run_locked():
             LOCK.unlink()
         fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        log.info("已有实例在运行，本次跳过")
+        if not _MODE.get("loop"):
+            log.info("已有实例在运行，本次跳过")
         return
     try:
         os.write(fd, str(os.getpid()).encode()); os.close(fd)
@@ -425,6 +447,31 @@ def run_locked():
         LOCK.unlink(missing_ok=True)
 
 
+def loop():
+    """常驻模式：算完一轮马上接着算（loop_interval_sec 为两轮之间的最短间隔，默认 1 秒，0 表示完全不停）。
+    单轮出错只记录不退出；进程本身挂掉由 systemd Restart=always / Windows 计划任务 / 看门狗拉起。"""
+    import os
+    cfg = load_cfg()
+    hb = read_heartbeat()
+    if hb.get("pid") and hb["pid"] != os.getpid() and hb.get("mode") == "loop" and now_ms() - hb.get("last_run_ts", 0) < 60_000:
+        log.info(f"已有常驻进程在运行（PID {hb['pid']}，心跳 {(now_ms() - hb['last_run_ts']) / 1000:.0f} 秒前），本进程退出")
+        return
+    _MODE["loop"] = True
+    log.info(f"常驻循环启动（PID {os.getpid()}，每轮最短间隔 {cfg.get('loop_interval_sec', 1)} 秒）")
+    n = 0
+    while True:
+        t0 = time.time()
+        try:
+            run_locked()
+        except Exception as e:                     # 不让任何异常把循环带走
+            log.error(f"本轮异常：{e}\n{traceback.format_exc()}")
+            time.sleep(5)
+        n += 1
+        if n % 600 == 0:
+            log.info(f"常驻循环已运行 {n} 轮")
+        time.sleep(max(0.0, float(load_cfg().get("loop_interval_sec", 1)) - (time.time() - t0)))
+
+
 if __name__ == "__main__":
     setup_logging()
-    {"run": run_locked, "report": report}.get(sys.argv[1] if len(sys.argv) > 1 else "run", run_locked)()
+    {"run": run_locked, "report": report, "loop": loop}.get(sys.argv[1] if len(sys.argv) > 1 else "run", run_locked)()

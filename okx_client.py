@@ -8,6 +8,8 @@ BASE = "https://www.okx.com"
 _session = requests.Session()
 # 可重试的 OKX 错误码：50011 限频、50001 服务暂不可用、50004 接口超时、50013 系统繁忙、50026 系统错误
 RETRY_CODES = {"50011", "50001", "50004", "50013", "50026"}
+BAR_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1H": 3_600_000, "2H": 7_200_000,
+          "4H": 14_400_000, "1D": 86_400_000}
 
 
 def get(path, params=None, retries=5):
@@ -57,7 +59,10 @@ def candles(inst_id, bar, n=500):
     df = df.astype({"ts": "int64", "o": float, "h": float, "l": float, "c": float,
                     "vol": float, "volCcy": float, "volQuote": float, "confirm": int})
     df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
-    df = df[df.confirm == 1].reset_index(drop=True)
+    # 已收盘：OKX 标记 confirm=1，或该 K 线的结束时间已过（刚收盘时 confirm 标记可能晚几秒更新，不等它）
+    dur = BAR_MS.get(bar)
+    now = time.time() * 1000
+    df = df[(df.confirm == 1) | ((df.ts + dur <= now - 1000) if dur else False)].reset_index(drop=True)
     df["time"] = pd.to_datetime(df.ts, unit="ms", utc=True).dt.tz_convert("Asia/Shanghai")
     return df
 

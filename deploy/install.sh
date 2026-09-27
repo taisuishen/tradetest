@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 在 Linux 服务器上一键部署模拟交易（支持 CentOS 7/8/9、Rocky/Alma、Ubuntu/Debian）：
-#   每 5 分钟运行一次 trader15.py（systemd timer），看板通过 8080 端口提供，看门狗每 10 分钟检活
+#   trader15.py 常驻循环（systemd 服务，崩溃自动重启、开机自启），看板通过 8080 端口提供，看门狗每 10 分钟检活
 # 用法：sudo bash deploy/install.sh [看板端口，默认 8080]
 set -euo pipefail
 
@@ -56,32 +56,29 @@ if [ "${SKIP_SYSTEMD:-0}" = "1" ]; then   # 仅用于在容器里测试 Python �
   exit 0
 fi
 
+# 交易主进程：常驻循环，算完一轮马上接着算；进程退出或崩溃 5 秒后自动重启，开机自启
+# （旧版本用的是每 N 分钟一次的定时器，这里先停掉并删除）
+systemctl disable --now paper-trader.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/paper-trader.timer
 cat > /etc/systemd/system/paper-trader.service <<EOF
 [Unit]
-Description=15m chan paper trader (one run)
+Description=15m chan paper trader (resident loop)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
-Type=oneshot
+Type=simple
 User=$RUN_USER
 WorkingDirectory=$APP_DIR
-Environment=TZ=Asia/Shanghai
-ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/trader15.py run
-TimeoutStartSec=240
-EOF
-
-cat > /etc/systemd/system/paper-trader.timer <<EOF
-[Unit]
-Description=Run 15m chan paper trader every 5 minutes
-
-[Timer]
-OnCalendar=*:0/5
-Persistent=true
-AccuracySec=5s
+Environment=TZ=Asia/Shanghai PYTHONUNBUFFERED=1
+ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/trader15.py loop
+Restart=always
+RestartSec=5
+Nice=5
 
 [Install]
-WantedBy=timers.target
+WantedBy=multi-user.target
 EOF
 
 # 看板：只对外提供 web/ 目录（数据库和配置不暴露）
@@ -129,8 +126,9 @@ WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now paper-trader.timer paper-dashboard.service paper-watchdog.timer
-systemctl start paper-trader.service || true
+systemctl enable paper-trader.service paper-dashboard.service paper-watchdog.timer
+systemctl restart paper-trader.service paper-dashboard.service
+systemctl start paper-watchdog.timer
 
 # CentOS 默认开着 firewalld：放行看板端口（云厂商安全组仍需另外放行）
 if systemctl is-active --quiet firewalld 2>/dev/null; then
@@ -138,7 +136,7 @@ if systemctl is-active --quiet firewalld 2>/dev/null; then
 fi
 
 echo "==> 完成"
-echo "   查看定时器：systemctl list-timers 'paper-*'"
+echo "   交易进程：  systemctl status paper-trader --no-pager"
 echo "   看门狗日志：tail -f $APP_DIR/watchdog.log"
 echo "   查看日志：  tail -f $APP_DIR/trader15.log"
 echo "   统计：      $APP_DIR/.venv/bin/python $APP_DIR/trader15.py report"
