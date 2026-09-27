@@ -15,6 +15,8 @@ import os
 
 import pandas as pd
 
+import sizing
+
 M15, H = 900_000, 3_600_000
 LONG = {"一买", "二买", "三买", "盘背买"}
 SHORT = {"一卖", "二卖", "三卖", "盘背卖"}
@@ -135,7 +137,10 @@ def simulate(Ts, p15, p1h, b5, unit, v, fee=2.0):
                     continue                                  # 价格已回到买卖点另一侧，结构失效
                 risk = abs(entry - stop)
                 tp = entry + side * v["tp_rr"] * risk if v.get("tp_rr") else None
+                score = strength(hr, side)
+                mult = size_from_score(score, v.get("sizing")) if v.get("sizing") else v.get("fixed_mult", 1.0)
                 pos = {"side": side, "type": t, "entry": entry, "stop": stop, "tp": tp, "ts": T, "risk": risk,
+                       "score": score, "mult": mult,
                        "rem": 1.0, "realized": 0.0, "be_done": False, "part_done": False}
                 break
         if not pos:
@@ -167,9 +172,23 @@ def simulate(Ts, p15, p1h, b5, unit, v, fee=2.0):
     return pd.DataFrame(trades)
 
 
+def strength(hr, side):
+    """信号 / 趋势强弱评分，见 sizing.py。"""
+    if not hr:
+        return 0.0
+    return sizing.strength(hr["trend"], hr["eff1h"], hr["trend1h_chan"], hr["adx4h"], side)
+
+
+def size_from_score(score, mode):
+    return sizing.size_from_score(score, mode)
+
+
 def close(pos, px, ts_, why, unit, fee):
-    gross = pos.get("realized", 0.0) + (px - pos["entry"]) * pos["side"] * unit * pos.get("rem", 1.0)
+    m = pos.get("mult", 1.0)
+    gross = (pos.get("realized", 0.0) + (px - pos["entry"]) * pos["side"] * unit * pos.get("rem", 1.0)) * m
+    fee = fee * m
     return {"ts": pos["ts"], "type": pos["type"], "side": "多" if pos["side"] > 0 else "空",
+            "mult": m, "score": round(pos.get("score", 0), 3), "net_per_1x": round((gross - fee) / m, 2),
             "start": datetime.fromtimestamp(pos["ts"] / 1000).strftime("%m-%d %H:%M"),
             "end": datetime.fromtimestamp(ts_ / 1000).strftime("%m-%d %H:%M"),
             "entry": round(pos["entry"], 2), "exit": round(px, 2), "result": why, "net": round(gross - fee, 2)}

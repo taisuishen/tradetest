@@ -2,14 +2,15 @@
 15 分钟级缠论单仓模拟交易（只模拟，不下真实订单）。
 
 规则（chan15_lab.py 控制变量测试得出的组合：区间套 + 大方向过滤 + 只做三类买卖点）：
-  入场：15m 新确认的三买做多 / 三卖做空，按当前价成交（不计滑点），每次 1 倍仓位，不加仓
+  入场：15m 新确认的三买做多 / 三卖做空，按当前价成交（不计滑点），不加仓
+  仓位：按信号 / 趋势强弱评分动态分档 0.5 / 1 / 2 / 3 / 5 倍（sizing.py；120 天回测比同等平均仓位多赚约 39%、回撤更小）
   过滤：① 大方向：1H*0.6 + 4H*0.4 趋势分不能明显相反（多单要求 > -1，空单要求 < +1）
         ② 区间套：1H 缠论方向（走势 + 近期买卖点）不能相反
         ③ 行情性质：只做趋势——1H 近 48 根 K 线趋势效率（净涨跌 / 逐根涨跌绝对值之和）≥ 25%，
            震荡行情里的突破不做（120 天回测：回撤 246U→138U，9 月由 −111U 转为 +37U）
   止损：买卖点价格外 0.5 ATR(15m)；用 1 分钟 K 线高低点逐根判定，按止损价原价成交
   离场：止损，或持仓中 15m 出现反向买卖点（按当时价格平仓）；不设固定止盈
-  手续费：每笔平仓每 1 倍扣 2U（ETH 1 个 / BTC 0.03 个）
+  手续费：每笔平仓每 1 倍扣 2U（1 倍 = ETH 1 个 / BTC 0.03 个，5 倍即扣 10U）
 
 用法：python trader15.py run | report
 """
@@ -27,6 +28,7 @@ ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 import chan  # noqa: E402
 import okx_client as ox  # noqa: E402
+import sizing  # noqa: E402
 import ta  # noqa: E402
 
 TZ = timezone(timedelta(hours=8))
@@ -39,6 +41,7 @@ DEFAULT_CFG = {
     "trend_threshold": 1.0,
     "nest_filter": True,
     "min_trend_eff_1h": 0.25,  # 1H 趋势效率下限，0 表示不过滤
+    "sizing": "step",          # 动态仓位：step=按评分分档 0.5/1/2/3/5 倍，linear=0.5~5 倍线性，""=固定 1 倍（见 sizing.py）
     "stop_buffer_atr": 0.5,
     "fresh_bars": 3,            # 买卖点确认后多少根 15m 内还算“新”
     # 告警推送（可选，留空即关闭）：钉钉 / 企业微信群机器人 Webhook，或 Telegram 机器人
@@ -189,7 +192,7 @@ def handle(con, cfg, inst, unit):
             signal(con, inst, price, "平仓", f"#{t['id']} 15m 出现{opp[0]}，按 {price:.6g} 离场 净{net:+.2f}U")
             return
         upnl = (price - t["entry_px"]) * (1 if long else -1) * t["qty"]
-        signal(con, inst, price, "持仓", f"#{t['id']} {t['point']}{'多' if long else '空'} @{t['entry_px']:.6g} 止损{t['stop']:.6g} 浮盈{upnl:+.2f}U")
+        signal(con, inst, price, "持仓", f"#{t['id']} {t['point']}{'多' if long else '空'} {t['mult']:g} 倍 @{t['entry_px']:.6g} 止损{t['stop']:.6g} 浮盈{upnl:+.2f}U")
         return
 
     cands = []
@@ -225,15 +228,20 @@ def handle(con, cfg, inst, unit):
         if (stop - price) * side >= 0:
             notes.append(f"{tp}（{px:.6g}）已被价格打穿，结构失效"); continue
         ts_now = now_ms()
+        adx4h = float(r4["adx"]["adx"])
+        score = sizing.strength(trend, eff, ch1["trend"], adx4h, side)
+        mult = sizing.size_from_score(score, cfg["sizing"]) if cfg.get("sizing") else 1.0
+        qty = unit * mult
         ctx = {"trend": round(trend, 2), "chan1h_trend": ch1["trend"], "chan1h_bias": bias, "atr15": round(atr, 6),
-               "trend_eff_1h": round(eff, 3)}
+               "trend_eff_1h": round(eff, 3), "adx4h": round(adx4h, 1), "score": round(score, 3)}
         cur = con.execute("""insert into trades(inst, side, point, point_ts, point_px, qty, mult, entry_ts, entry_px, stop,
                              last_checked_ts, context) values(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                          (inst, "long" if side > 0 else "short", tp, ts_, px, unit, 1.0, ts_now, price, stop,
+                          (inst, "long" if side > 0 else "short", tp, ts_, px, qty, mult, ts_now, price, stop,
                            ts_now // 60_000 * 60_000 + 60_000, json.dumps(ctx, ensure_ascii=False)))
         con.commit()
-        signal(con, inst, price, "开仓", f"#{cur.lastrowid} {tp}{'做多' if side > 0 else '做空'} @{price:.6g}（买卖点 {px:.6g}），"
-                                        f"止损 {stop:.6g}，风险 {abs(price - stop) * unit:.2f}U；大方向 {trend:+.2f}，1H 缠论{ch1['trend']}，1H 趋势效率 {eff:.0%}")
+        signal(con, inst, price, "开仓", f"#{cur.lastrowid} {tp}{'做多' if side > 0 else '做空'} {mult:g} 倍（评分 {score:.2f}）@{price:.6g}"
+                                        f"（买卖点 {px:.6g}），止损 {stop:.6g}，风险 {abs(price - stop) * qty:.2f}U；"
+                                        f"大方向 {trend:+.2f}，1H 缠论{ch1['trend']}，1H 趋势效率 {eff:.0%}，4H ADX {adx4h:.0f}")
         return
     signal(con, inst, price, "放弃", "；".join(notes))
 
@@ -317,12 +325,13 @@ def write_dashboard(con, cfg):
         p = prices.get(t["inst"]); s_ = 1 if t["side"] == "long" else -1
         up = f"{money((p - t['entry_px']) * s_ * t['qty'])}" if p else "-"
         return (f"<tr><td>{t['inst'].split('-')[0]}</td><td class='{'up' if s_ > 0 else 'down'}'>{t['point']}{'多' if s_ > 0 else '空'}</td>"
+                f"<td>{t['mult']:g}×</td><td>{json.loads(t['context'] or '{}').get('score', '-')}</td>"
                 f"<td>{t['entry_px']:.6g}</td><td>{p and f'{p:.6g}'}</td><td class='down'>{t['stop']:.6g}</td><td>{up}</td><td>{bj(t['entry_ts'])}</td></tr>")
-    open_rows = "".join(orow(t) for t in opens) or '<tr><td colspan="7" class="muted">无持仓</td></tr>'
+    open_rows = "".join(orow(t) for t in opens) or '<tr><td colspan="9" class="muted">无持仓</td></tr>'
     closed_rows = "".join(
         f"<tr><td>{t['id']}</td><td>{t['inst'].split('-')[0]}</td><td class='{'up' if t['side'] == 'long' else 'down'}'>{t['point']}</td>"
         f"<td>{bj(t['entry_ts'])}</td><td>{bj(t['exit_ts'])}</td><td>{t['entry_px']:.6g}</td><td>{t['exit_px']:.6g}</td>"
-        f"<td>{t['exit_reason']}</td><td>{money(t['net'])}</td></tr>" for t in closed) or '<tr><td colspan="9" class="muted">暂无</td></tr>'
+        f"<td>{t['exit_reason']}</td><td>{t['mult']:g}×</td><td>{money(t['net'])}</td></tr>" for t in closed) or '<tr><td colspan="10" class="muted">暂无</td></tr>'
     per_rows = "".join(f"<tr><td>{i}</td><td>{cfg['instruments'][i]['unit']}</td><td>{p['n']}</td><td>{p['wr']:.1f}%</td>"
                        f"<td>{money(p['net'])}</td><td>{p['fees']:.0f}</td><td>{p['mdd']:.1f}</td></tr>" for i, p in per.items())
     sig_rows = "".join(f"<tr><td>{bj(g['ts'])}</td><td>{g['inst'].split('-')[0]}</td><td>{g['decision']}</td><td class='d'>{g['detail']}</td></tr>" for g in sigs)
@@ -352,7 +361,7 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
 </style></head><body>
 <h1>15 分钟级缠论模拟交易</h1>
 {health}
-<div class="muted">只模拟，不下真实单｜15m 三买 / 三卖入场，区间套（1H 缠论）+ 大方向 + 只做趋势（1H 趋势效率≥{cfg['min_trend_eff_1h']:.0%}）｜止损在买卖点外 0.5 ATR，反向买卖点离场｜
+<div class="muted">只模拟，不下真实单｜15m 三买 / 三卖入场，区间套（1H 缠论）+ 大方向 + 只做趋势（1H 趋势效率≥{cfg['min_trend_eff_1h']:.0%}）｜按强弱动态 0.5~5 倍｜止损在买卖点外 0.5 ATR，反向买卖点离场｜
 每笔每 1 倍扣 {cfg['fee_per_unit']}U，不计滑点｜每 5 分钟运行｜开始于 {bj(first)}｜更新于 {datetime.now(TZ):%m-%d %H:%M:%S}</div>
 <div class="grid">
 <div class="kpi"><span>胜率</span><b>{s['wr']:.1f}%</b><span>{s['w']} 胜 / {s['l']} 负</span></div>
@@ -362,9 +371,9 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
 <div class="kpi"><span>最大回撤</span><b>{s['mdd']:.2f} U</b><span>按已平仓计</span></div>
 </div>
 <div class="card"><h2>权益曲线（净利润累计）</h2>{svg}</div>
-<div class="card"><h2>当前持仓</h2><table><tr><th>合约</th><th>方向</th><th>入场</th><th>现价</th><th>止损</th><th>浮盈U</th><th>开仓</th></tr>{open_rows}</table></div>
+<div class="card"><h2>当前持仓</h2><table><tr><th>合约</th><th>方向</th><th>倍数</th><th>评分</th><th>入场</th><th>现价</th><th>止损</th><th>浮盈U</th><th>开仓</th></tr>{open_rows}</table></div>
 <div class="card"><h2>分合约</h2><table><tr><th>合约</th><th>1倍数量</th><th>笔数</th><th>胜率</th><th>净利U</th><th>手续费U</th><th>最大回撤U</th></tr>{per_rows}</table></div>
-<div class="card"><h2>已平仓（最近 100 笔）</h2><table><tr><th>#</th><th>合约</th><th>买卖点</th><th>开仓</th><th>平仓</th><th>入场</th><th>出场</th><th>结果</th><th>净利U</th></tr>{closed_rows}</table></div>
+<div class="card"><h2>已平仓（最近 100 笔）</h2><table><tr><th>#</th><th>合约</th><th>买卖点</th><th>开仓</th><th>平仓</th><th>入场</th><th>出场</th><th>结果</th><th>倍数</th><th>净利U</th></tr>{closed_rows}</table></div>
 <div class="card"><h2>最近分析记录</h2><table><tr><th>时间</th><th>合约</th><th>决策</th><th>说明</th></tr>{sig_rows}</table></div>
 </body></html>"""
     (ROOT / "web").mkdir(exist_ok=True)
