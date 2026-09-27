@@ -106,5 +106,6 @@ def ensure_windows_dashboard(port):
 
 
 if __name__ == "__main__":
-    sys.stdout.reconfigure(encoding="utf-8")
+    if sys.stdout:                     # pythonw（Windows 后台运行）没有控制台，stdout 为 None
+        sys.stdout.reconfigure(encoding="utf-8")
     main()
