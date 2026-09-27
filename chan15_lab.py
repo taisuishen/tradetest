@@ -15,6 +15,7 @@ import os
 
 import pandas as pd
 
+import fees
 import sizing
 
 M15, H = 900_000, 3_600_000
@@ -77,12 +78,13 @@ def precompute(inst, days):
     return Ts, p15, p1h, list(zip(df5.ts.astype("int64"), df5.h, df5.l))
 
 
-def simulate(Ts, p15, p1h, b5, unit, v, fee=2.0):
+def simulate(Ts, p15, p1h, b5, unit, v, fee=2.0, fm=None):
     """v: 方案参数
     types 允许的买卖点；trend_filter 大方向不相反；trend_min 大方向至少同向到多少（设了就替代 trend_filter）；
     nest 1H 缠论方向不相反；nest_strict 1H 缠论方向必须同向；stop_buf 止损缓冲（ATR）；
     exit 'opp' / 'trail'；tp_rr 固定止盈倍数；be_r 浮盈几倍风险后止损移到保本（开仓价 + 手续费）；
-    part_r / part_frac 到几倍风险先平掉多少比例，part_be 分批后剩余仓位是否移到保本"""
+    part_r / part_frac 到几倍风险先平掉多少比例，part_be 分批后剩余仓位是否移到保本
+    fm：真实费用模型 {"taker": 吃单费率, "funding": [(结算时间, 费率)]}；为 None 时每 1 倍固定扣 fee"""
     trades, pos, used, j = [], None, set(), 0
     for T in Ts:
         info = p15.get(T)
@@ -140,7 +142,7 @@ def simulate(Ts, p15, p1h, b5, unit, v, fee=2.0):
                 score = strength(hr, side)
                 mult = size_from_score(score, v.get("sizing")) if v.get("sizing") else v.get("fixed_mult", 1.0)
                 pos = {"side": side, "type": t, "entry": entry, "stop": stop, "tp": tp, "ts": T, "risk": risk,
-                       "score": score, "mult": mult,
+                       "score": score, "mult": mult, "fm": fm,
                        "rem": 1.0, "realized": 0.0, "be_done": False, "part_done": False}
                 break
         if not pos:
@@ -186,12 +188,18 @@ def size_from_score(score, mode):
 def close(pos, px, ts_, why, unit, fee):
     m = pos.get("mult", 1.0)
     gross = (pos.get("realized", 0.0) + (px - pos["entry"]) * pos["side"] * unit * pos.get("rem", 1.0)) * m
-    fee = fee * m
+    funding = 0.0
+    if pos.get("fm"):   # 按 OKX 费率：成交金额 × 吃单费率（开平各一次）+ 持仓期间实际资金费
+        fee = fees.trade_fee(pos["entry"], px, unit * m, pos["fm"]["taker"])
+        funding = fees.funding_cost(pos["side"], unit * m, pos["entry"], pos["ts"], ts_, pos["fm"]["funding"])
+    else:
+        fee = fee * m
     return {"ts": pos["ts"], "type": pos["type"], "side": "多" if pos["side"] > 0 else "空",
-            "mult": m, "score": round(pos.get("score", 0), 3), "net_per_1x": round((gross - fee) / m, 2),
+            "mult": m, "score": round(pos.get("score", 0), 3), "net_per_1x": round((gross - fee - funding) / m, 2),
+            "fee": round(fee, 3), "funding": round(funding, 3),
             "start": datetime.fromtimestamp(pos["ts"] / 1000).strftime("%m-%d %H:%M"),
             "end": datetime.fromtimestamp(ts_ / 1000).strftime("%m-%d %H:%M"),
-            "entry": round(pos["entry"], 2), "exit": round(px, 2), "result": why, "net": round(gross - fee, 2)}
+            "entry": round(pos["entry"], 2), "exit": round(px, 2), "result": why, "net": round(gross - fee - funding, 2)}
 
 
 def stats(df):

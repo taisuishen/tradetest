@@ -13,3 +13,5 @@ __pycache__/
 trader15_config.json
 heartbeat.json
 *.lock
+okx_api.json
+fee_rates.json

@@ -1,0 +1,6 @@
+{
+  "_说明": "可选。复制为 okx_api.json 并填写 OKX【只读】API Key，用于获取你账户的真实手续费率（与 VIP 等级有关）。不填则按 Lv1 标准费率：吃单 0.05%。创建 Key 时只勾选“读取”权限，不要勾选交易和提现。okx_api.json 已在 .gitignore 中，不会上传。",
+  "api_key": "",
+  "secret": "",
+  "passphrase": ""
+}

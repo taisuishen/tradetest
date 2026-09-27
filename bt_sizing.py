@@ -11,7 +11,7 @@ def summarize(name, dfs, mid):
     eq = df.net.cumsum(); mdd = float((eq.cummax().clip(lower=0) - eq).max())
     return {"方案": name, "笔数": len(df), "胜率%": round((df.net > 0).mean() * 100, 1),
             "平均倍数": round(df.mult.mean(), 2), "前半": round(df[df.ts < mid].net.sum(), 1), "后半": round(df[df.ts >= mid].net.sum(), 1),
-            "全程净利": round(df.net.sum(), 1), "手续费": round((2 * df.mult).sum(), 1), "最大回撤": round(mdd, 1),
+            "全程净利": round(df.net.sum(), 1), "手续费": round(df.fee.sum(), 1), "资金费": round(df.funding.sum(), 1), "最大回撤": round(mdd, 1),
             "收益回撤比": round(df.net.sum() / mdd, 2) if mdd else float("inf"),
             "每1倍净利": round(df.net.sum() / df.mult.mean(), 1)}
 
@@ -19,14 +19,19 @@ def summarize(name, dfs, mid):
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8"); pd.set_option("display.width", 250)
     days = int(sys.argv[1]) if len(sys.argv) > 1 else 120
-    data = {}
+    import time, fees
+    fm_mode = sys.argv[2] if len(sys.argv) > 2 else "okx"      # okx=按 OKX 费率 + 实际资金费；fixed=每 1 倍固定 2U
+    data, fms = {}, {}
     for inst, unit in (("ETH-USDT-SWAP", 1.0), ("BTC-USDT-SWAP", 0.03)):
         data[inst] = (unit, *lab.precompute(inst, days))
+        fms[inst] = ({"taker": fees.rates(inst)["taker"], "funding": fees.funding_history(inst, int(time.time() * 1000) - (days + 1) * 86_400_000)}
+                     if fm_mode == "okx" else None)
+    print(f"费用模型：{'OKX 吃单费率 ' + str(fees.rates('ETH-USDT-SWAP')) + ' + 实际资金费' if fm_mode == 'okx' else '每 1 倍固定 2U'}")
     mid = data["ETH-USDT-SWAP"][1][len(data["ETH-USDT-SWAP"][1]) // 2]
     def run(v):
         out = []
         for inst, (unit, Ts, p15, p1h, b5) in data.items():
-            d = lab.simulate(Ts, p15, p1h, b5, unit, v); d["inst"] = inst[:3]; out.append(d)
+            d = lab.simulate(Ts, p15, p1h, b5, unit, v, fm=fms[inst]); d["inst"] = inst[:3]; out.append(d)
         return out
     base = run(LIVE); step = run({**LIVE, "sizing": "step"}); lin = run({**LIVE, "sizing": "linear"})
     m_step = pd.concat(step).mult.mean(); m_lin = pd.concat(lin).mult.mean()

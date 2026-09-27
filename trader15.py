@@ -10,7 +10,8 @@
            震荡行情里的突破不做（120 天回测：回撤 246U→138U，9 月由 −111U 转为 +37U）
   止损：买卖点价格外 0.5 ATR(15m)；用 1 分钟 K 线高低点逐根判定，按止损价原价成交
   离场：止损，或持仓中 15m 出现反向买卖点（按当时价格平仓）；不设固定止盈
-  手续费：每笔平仓每 1 倍扣 2U（1 倍 = ETH 1 个 / BTC 0.03 个，5 倍即扣 10U）
+  费用：交易手续费 = 成交金额 × OKX 吃单费率（开平各一次；配置只读 API Key 时用账户真实费率，否则 Lv1 标准 0.05%），
+        另加持仓期间 OKX 实际资金费（fees.py）；fee_mode=fixed 可改回每 1 倍固定 2U
 
 用法：python trader15.py run | report
 """
@@ -28,6 +29,7 @@ ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 import chan  # noqa: E402
 import okx_client as ox  # noqa: E402
+import fees  # noqa: E402
 import sizing  # noqa: E402
 import ta  # noqa: E402
 
@@ -35,6 +37,7 @@ TZ = timezone(timedelta(hours=8))
 CFG_PATH = ROOT / "trader15_config.json"
 DEFAULT_CFG = {
     "instruments": {"ETH-USDT-SWAP": {"unit": 1.0}, "BTC-USDT-SWAP": {"unit": 0.03}},
+    "fee_mode": "okx",          # okx：成交金额 × OKX 吃单费率 + 实际资金费（见 fees.py）；fixed：每 1 倍固定 fee_per_unit
     "fee_per_unit": 2.0,
     "entry_points": ["三买", "三卖"],
     "trend_filter": True,
@@ -83,10 +86,12 @@ def db():
         id integer primary key autoincrement, inst text, side text, point text, point_ts integer, point_px real,
         qty real, mult real, entry_ts integer, entry_px real, stop real,
         exit_ts integer, exit_px real, exit_reason text, gross real, fee real, net real,
-        last_checked_ts integer, context text);
+        last_checked_ts integer, context text, funding real default 0);
     create table if not exists used_points(inst text, type text, ts integer, primary key(inst, type, ts));
     create table if not exists signals(ts integer, inst text, price real, decision text, detail text);
     """)
+    if "funding" not in [r[1] for r in con.execute("pragma table_info(trades)")]:   # 旧库升级
+        con.execute("alter table trades add column funding real default 0"); con.commit()
     return con
 
 
@@ -160,13 +165,26 @@ def candles_1m_since(inst, since_ms):
     return sorted({(int(r[0]), float(r[2]), float(r[3])) for r in rows if r[8] == "1" and int(r[0]) >= since_ms})
 
 
+def costs(cfg, t, exit_px, end_ms):
+    """返回 (交易手续费, 资金费, 费率说明)。fee_mode=okx：成交金额 × OKX 吃单费率（开平各一次）+ 持仓期间实际资金费；
+    fixed：每 1 倍固定 fee_per_unit。"""
+    if cfg.get("fee_mode", "okx") != "okx":
+        return cfg["fee_per_unit"] * t["mult"], 0.0, f"固定每 1 倍 {cfg['fee_per_unit']}U"
+    r = fees.rates(t["inst"])
+    s = 1 if t["side"] == "long" else -1
+    fee = fees.trade_fee(t["entry_px"], exit_px, t["qty"], r["taker"])
+    fund = fees.funding_cost(s, t["qty"], t["entry_px"], t["entry_ts"], end_ms, fees.funding_history(t["inst"], t["entry_ts"]))
+    return fee, fund, f"吃单 {r['taker'] * 100:.3f}%（{r['source']}）"
+
+
 def close_trade(con, cfg, t, px, ts_, reason):
     s = 1 if t["side"] == "long" else -1
     gross = (px - t["entry_px"]) * s * t["qty"]
-    fee = cfg["fee_per_unit"] * t["mult"]
-    con.execute("update trades set exit_ts=?, exit_px=?, exit_reason=?, gross=?, fee=?, net=?, last_checked_ts=? where id=?",
-                (ts_, px, reason, gross, fee, gross - fee, ts_, t["id"])); con.commit()
-    return gross - fee
+    fee, fund, _ = costs(cfg, t, px, ts_)
+    net = gross - fee - fund
+    con.execute("update trades set exit_ts=?, exit_px=?, exit_reason=?, gross=?, fee=?, funding=?, net=?, last_checked_ts=? where id=?",
+                (ts_, px, reason, gross, fee, fund, net, ts_, t["id"])); con.commit()
+    return net
 
 
 def handle(con, cfg, inst, unit):
@@ -192,7 +210,9 @@ def handle(con, cfg, inst, unit):
             signal(con, inst, price, "平仓", f"#{t['id']} 15m 出现{opp[0]}，按 {price:.6g} 离场 净{net:+.2f}U")
             return
         upnl = (price - t["entry_px"]) * (1 if long else -1) * t["qty"]
-        signal(con, inst, price, "持仓", f"#{t['id']} {t['point']}{'多' if long else '空'} {t['mult']:g} 倍 @{t['entry_px']:.6g} 止损{t['stop']:.6g} 浮盈{upnl:+.2f}U")
+        fee, fund, _ = costs(cfg, t, price, now_ms())
+        signal(con, inst, price, "持仓", f"#{t['id']} {t['point']}{'多' if long else '空'} {t['mult']:g} 倍 @{t['entry_px']:.6g} 止损{t['stop']:.6g} "
+                                        f"浮盈{upnl:+.2f}U（扣除预计手续费 {fee:.2f}U、已发生资金费 {fund:+.2f}U 后 {upnl - fee - fund:+.2f}U）")
         return
 
     cands = []
@@ -285,7 +305,7 @@ def stats(con, inst=None):
         eq += r["net"]; peak = max(peak, eq); mdd = max(mdd, peak - eq); curve.append(eq)
     gw = sum(r["net"] for r in w); gl = -sum(r["net"] for r in l)
     return {"n": len(rows), "w": len(w), "l": len(l), "wr": len(w) / len(rows) * 100 if rows else 0.0, "net": eq,
-            "gross": sum(r["gross"] for r in rows), "fees": sum(r["fee"] for r in rows),
+            "gross": sum(r["gross"] for r in rows), "fees": sum(r["fee"] for r in rows), "funding": sum(r["funding"] or 0 for r in rows),
             "avg_w": gw / len(w) if w else 0.0, "avg_l": -gl / len(l) if l else 0.0,
             "pf": gw / gl if gl else (float("inf") if gw else 0.0), "mdd": mdd, "curve": curve}
 
@@ -331,11 +351,16 @@ def write_dashboard(con, cfg):
     closed_rows = "".join(
         f"<tr><td>{t['id']}</td><td>{t['inst'].split('-')[0]}</td><td class='{'up' if t['side'] == 'long' else 'down'}'>{t['point']}</td>"
         f"<td>{bj(t['entry_ts'])}</td><td>{bj(t['exit_ts'])}</td><td>{t['entry_px']:.6g}</td><td>{t['exit_px']:.6g}</td>"
-        f"<td>{t['exit_reason']}</td><td>{t['mult']:g}×</td><td>{money(t['net'])}</td></tr>" for t in closed) or '<tr><td colspan="10" class="muted">暂无</td></tr>'
+        f"<td>{t['exit_reason']}</td><td>{t['mult']:g}×</td><td>{t['fee']:.2f}</td><td>{(t['funding'] or 0):+.2f}</td><td>{money(t['net'])}</td></tr>" for t in closed) or '<tr><td colspan="12" class="muted">暂无</td></tr>'
     per_rows = "".join(f"<tr><td>{i}</td><td>{cfg['instruments'][i]['unit']}</td><td>{p['n']}</td><td>{p['wr']:.1f}%</td>"
                        f"<td>{money(p['net'])}</td><td>{p['fees']:.0f}</td><td>{p['mdd']:.1f}</td></tr>" for i, p in per.items())
     sig_rows = "".join(f"<tr><td>{bj(g['ts'])}</td><td>{g['inst'].split('-')[0]}</td><td>{g['decision']}</td><td class='d'>{g['detail']}</td></tr>" for g in sigs)
     pf = "∞" if s["pf"] == float("inf") else f"{s['pf']:.2f}"
+    if cfg.get("fee_mode", "okx") == "okx":
+        r_ = fees.rates(next(iter(cfg["instruments"])))
+        fee_desc = f"手续费按 OKX 吃单费率 {r_['taker'] * 100:.3f}%（{r_['source']}），另计实际资金费"
+    else:
+        fee_desc = f"每笔每 1 倍扣 {cfg['fee_per_unit']}U"
     hb = read_heartbeat()
     ce = hb.get("consecutive_errors", 0)
     # 服务端写入生成时间，页面里的脚本用浏览器当前时间判断是否停更（程序完全停止时也能发现）
@@ -362,18 +387,18 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
 <h1>15 分钟级缠论模拟交易</h1>
 {health}
 <div class="muted">只模拟，不下真实单｜15m 三买 / 三卖入场，区间套（1H 缠论）+ 大方向 + 只做趋势（1H 趋势效率≥{cfg['min_trend_eff_1h']:.0%}）｜按强弱动态 0.5~5 倍｜止损在买卖点外 0.5 ATR，反向买卖点离场｜
-每笔每 1 倍扣 {cfg['fee_per_unit']}U，不计滑点｜每 5 分钟运行｜开始于 {bj(first)}｜更新于 {datetime.now(TZ):%m-%d %H:%M:%S}</div>
+{fee_desc}，不计滑点｜每 5 分钟运行｜开始于 {bj(first)}｜更新于 {datetime.now(TZ):%m-%d %H:%M:%S}</div>
 <div class="grid">
 <div class="kpi"><span>胜率</span><b>{s['wr']:.1f}%</b><span>{s['w']} 胜 / {s['l']} 负</span></div>
 <div class="kpi"><span>净利润</span><b>{money(s['net'])} U</b><span>毛利 {s['gross']:+.2f}</span></div>
-<div class="kpi"><span>累计手续费</span><b>{s['fees']:.1f} U</b><span>{s['n']} 笔已平仓</span></div>
+<div class="kpi"><span>累计手续费 / 资金费</span><b>{s['fees']:.1f} / {s['funding']:+.1f} U</b><span>{s['n']} 笔已平仓</span></div>
 <div class="kpi"><span>盈亏因子</span><b>{pf}</b><span>均盈 {s['avg_w']:+.2f} / 均亏 {s['avg_l']:+.2f}</span></div>
 <div class="kpi"><span>最大回撤</span><b>{s['mdd']:.2f} U</b><span>按已平仓计</span></div>
 </div>
 <div class="card"><h2>权益曲线（净利润累计）</h2>{svg}</div>
 <div class="card"><h2>当前持仓</h2><table><tr><th>合约</th><th>方向</th><th>倍数</th><th>评分</th><th>入场</th><th>现价</th><th>止损</th><th>浮盈U</th><th>开仓</th></tr>{open_rows}</table></div>
 <div class="card"><h2>分合约</h2><table><tr><th>合约</th><th>1倍数量</th><th>笔数</th><th>胜率</th><th>净利U</th><th>手续费U</th><th>最大回撤U</th></tr>{per_rows}</table></div>
-<div class="card"><h2>已平仓（最近 100 笔）</h2><table><tr><th>#</th><th>合约</th><th>买卖点</th><th>开仓</th><th>平仓</th><th>入场</th><th>出场</th><th>结果</th><th>倍数</th><th>净利U</th></tr>{closed_rows}</table></div>
+<div class="card"><h2>已平仓（最近 100 笔）</h2><table><tr><th>#</th><th>合约</th><th>买卖点</th><th>开仓</th><th>平仓</th><th>入场</th><th>出场</th><th>结果</th><th>倍数</th><th>手续费</th><th>资金费</th><th>净利U</th></tr>{closed_rows}</table></div>
 <div class="card"><h2>最近分析记录</h2><table><tr><th>时间</th><th>合约</th><th>决策</th><th>说明</th></tr>{sig_rows}</table></div>
 </body></html>"""
     (ROOT / "web").mkdir(exist_ok=True)
