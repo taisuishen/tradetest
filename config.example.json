@@ -1,0 +1,13 @@
+{
+  "llm": {
+    "base_url": "https://api-ap-southeast-1.modelarts-maas.com/openai/v1",
+    "api_key": "",
+    "model": "deepseek-v4.1-flash",
+    "max_tokens": 32000,
+    "temperature": 0.3
+  },
+  "default_inst": "BTC-USDT-SWAP",
+  "orderbook_snapshots": 5,
+  "orderbook_interval_sec": 3,
+  "events": []
+}

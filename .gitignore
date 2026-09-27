@@ -1,0 +1,13 @@
+# 含 API Key，不入库（用 config.example.json 或环境变量 LLM_API_KEY）
+config.json
+# 运行产生的数据
+reports/
+bt/
+web/
+*.db
+*.log
+*.log.*
+paper_config.json
+__pycache__/
+.venv/
+trader15_config.json
