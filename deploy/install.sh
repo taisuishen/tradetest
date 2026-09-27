@@ -56,18 +56,47 @@ After=network.target
 User=$RUN_USER
 WorkingDirectory=$APP_DIR/web
 ExecStart=/usr/bin/python3 -m http.server $PORT --directory $APP_DIR/web
+RestartSec=5
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+# 看门狗：每 10 分钟检查心跳，超过 15 分钟没运行就重启定时器并拉起一次；看板服务挂了也会重启（以 root 运行）
+cat > /etc/systemd/system/paper-watchdog.service <<EOF
+[Unit]
+Description=Paper trader watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$APP_DIR
+Environment=TZ=Asia/Shanghai
+ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/watchdog.py
+TimeoutStartSec=300
+EOF
+
+cat > /etc/systemd/system/paper-watchdog.timer <<EOF
+[Unit]
+Description=Run paper trader watchdog every 10 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
-systemctl enable --now paper-trader.timer paper-dashboard.service
+systemctl enable --now paper-trader.timer paper-dashboard.service paper-watchdog.timer
 systemctl start paper-trader.service || true
 
 echo "==> 完成"
-echo "   查看定时器：systemctl list-timers paper-trader.timer"
+echo "   查看定时器：systemctl list-timers 'paper-*'"
+echo "   看门狗日志：tail -f $APP_DIR/watchdog.log"
 echo "   查看日志：  tail -f $APP_DIR/trader15.log"
 echo "   统计：      $APP_DIR/.venv/bin/python $APP_DIR/trader15.py report"
 echo "   看板：      http://<服务器IP>:$PORT/   （记得在云厂商安全组放行该端口）"

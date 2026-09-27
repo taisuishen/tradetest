@@ -41,10 +41,17 @@ DEFAULT_CFG = {
     "min_trend_eff_1h": 0.25,  # 1H 趋势效率下限，0 表示不过滤
     "stop_buffer_atr": 0.5,
     "fresh_bars": 3,            # 买卖点确认后多少根 15m 内还算“新”
+    # 告警推送（可选，留空即关闭）：钉钉 / 企业微信群机器人 Webhook，或 Telegram 机器人
+    "alert_webhook": "",
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "alert_after_errors": 3,    # 连续失败几次运行才告警
+    "alert_trades": False,      # 开仓 / 平仓时是否也推送
 }
 LONG = {"一买", "二买", "三买", "盘背买"}
 SHORT = {"一卖", "二卖", "三卖", "盘背卖"}
 DB = ROOT / "trader15.db"
+HEARTBEAT = ROOT / "heartbeat.json"
 LOG = ROOT / "trader15.log"
 log = logging.getLogger("t15")
 
@@ -91,6 +98,47 @@ def bj(ts):
 def signal(con, inst, price, decision, detail):
     con.execute("insert into signals values(?,?,?,?,?)", (now_ms(), inst, price, decision, detail)); con.commit()
     log.info(f"[{inst}] {decision}：{detail}")
+    if decision in ("开仓", "平仓") and _CFG.get("alert_trades"):
+        alert(_CFG, f"[{inst}] {decision}：{detail}")
+
+
+_CFG = {}
+
+
+def alert(cfg, text):
+    """推送告警；失败只记日志，不影响交易逻辑。"""
+    import requests
+    text = f"【模拟交易】{text}"
+    try:
+        if cfg.get("alert_webhook"):   # 钉钉 / 企业微信群机器人通用格式
+            requests.post(cfg["alert_webhook"], json={"msgtype": "text", "text": {"content": text}}, timeout=10)
+        if cfg.get("telegram_bot_token") and cfg.get("telegram_chat_id"):
+            requests.post(f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/sendMessage",
+                          json={"chat_id": cfg["telegram_chat_id"], "text": text}, timeout=10)
+    except Exception as e:
+        log.error(f"告警推送失败：{e}")
+
+
+def read_heartbeat():
+    try:
+        return json.loads(HEARTBEAT.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_heartbeat(ok, err=None):
+    hb = read_heartbeat()
+    now = now_ms()
+    hb["last_run_ts"] = now
+    if ok:
+        hb["last_ok_ts"] = now
+        hb["consecutive_errors"] = 0
+    else:
+        hb["consecutive_errors"] = hb.get("consecutive_errors", 0) + 1
+        hb["last_error"] = str(err)[:300]
+        hb["last_error_ts"] = now
+    HEARTBEAT.write_text(json.dumps(hb, ensure_ascii=False, indent=1), encoding="utf-8")
+    return hb
 
 
 def fresh_points(df15, cfg):
@@ -191,14 +239,32 @@ def handle(con, cfg, inst, unit):
 
 
 def run_once():
-    cfg = load_cfg(); con = db()
-    for inst, ic in cfg["instruments"].items():
-        try:
-            handle(con, cfg, inst, ic["unit"])
-        except Exception as e:
-            log.error(f"[{inst}] 出错：{e}\n{traceback.format_exc()}")
-            con.execute("insert into signals values(?,?,?,?,?)", (now_ms(), inst, None, "错误", str(e)[:300])); con.commit()
-    write_dashboard(con, cfg)
+    cfg = load_cfg(); _CFG.update(cfg); con = db()
+    prev = read_heartbeat()
+    errors = []
+    if not ox.reachable():
+        # 断网：本次什么都不做；恢复后用 1 分钟 K 线从上次检查点回放，不会漏掉期间的止损
+        errors.append("连不上 OKX（网络波动或被墙），本次跳过，恢复后自动补算")
+        con.execute("insert into signals values(?,?,?,?,?)", (now_ms(), "-", None, "错误", errors[0])); con.commit()
+        log.error(errors[0])
+    else:
+        for inst, ic in cfg["instruments"].items():
+            try:
+                handle(con, cfg, inst, ic["unit"])
+            except Exception as e:
+                errors.append(f"{inst}: {e}")
+                log.error(f"[{inst}] 出错：{e}\n{traceback.format_exc()}")
+                con.execute("insert into signals values(?,?,?,?,?)", (now_ms(), inst, None, "错误", str(e)[:300])); con.commit()
+    hb = write_heartbeat(not errors, "；".join(errors))
+    n = cfg.get("alert_after_errors", 3)
+    if errors and hb["consecutive_errors"] == n:
+        alert(cfg, f"已连续 {n} 次运行失败：{hb['last_error']}")
+    if not errors and prev.get("consecutive_errors", 0) >= n:
+        alert(cfg, f"已恢复正常（此前连续失败 {prev['consecutive_errors']} 次）")
+    try:
+        write_dashboard(con, cfg)
+    except Exception as e:
+        log.error(f"看板生成失败：{e}")
     con.close()
 
 
@@ -261,6 +327,14 @@ def write_dashboard(con, cfg):
                        f"<td>{money(p['net'])}</td><td>{p['fees']:.0f}</td><td>{p['mdd']:.1f}</td></tr>" for i, p in per.items())
     sig_rows = "".join(f"<tr><td>{bj(g['ts'])}</td><td>{g['inst'].split('-')[0]}</td><td>{g['decision']}</td><td class='d'>{g['detail']}</td></tr>" for g in sigs)
     pf = "∞" if s["pf"] == float("inf") else f"{s['pf']:.2f}"
+    hb = read_heartbeat()
+    ce = hb.get("consecutive_errors", 0)
+    # 服务端写入生成时间，页面里的脚本用浏览器当前时间判断是否停更（程序完全停止时也能发现）
+    health = (f'<div id="health" class="{"bad" if ce else "ok"}" data-ts="{now_ms()}">'
+              f'{"⚠️ 最近连续 " + str(ce) + " 次运行失败：" + hb.get("last_error", "") if ce else "● 运行正常"}'
+              f'｜最后成功运行 {bj(hb.get("last_ok_ts"))}</div>'
+              '<script>(function(){var e=document.getElementById("health");var m=(Date.now()-(+e.dataset.ts))/60000;'
+              'if(m>15){e.className="bad";e.textContent="⚠️ 看板已 "+Math.round(m)+" 分钟没有更新，程序可能已停止（正常每 5 分钟更新一次）";}})();</script>')
     html = f"""<!doctype html><html lang="zh"><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>缠论模拟交易看板</title>
 <style>
@@ -273,9 +347,11 @@ h1{{font-size:20px;margin:0 0 4px}} h2{{font-size:15px;margin:0 0 8px}} .muted{{
 table{{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;white-space:nowrap}}
 th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}} th{{color:var(--sub);font-weight:500;font-size:12px}}
 td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
+#health{{margin:6px 0;padding:6px 10px;border-radius:8px;font-size:13px}} .ok{{background:#10281f;color:var(--up)}} .bad{{background:#3a1518;color:#ff8a8a}}
 .curve{{width:100%;height:170px}} .curve path{{fill:none;stroke-width:2}} .lu{{stroke:var(--up)}} .ld{{stroke:var(--down)}} .zero{{stroke:var(--line);stroke-dasharray:4 4}}
 </style></head><body>
 <h1>15 分钟级缠论模拟交易</h1>
+{health}
 <div class="muted">只模拟，不下真实单｜15m 三买 / 三卖入场，区间套（1H 缠论）+ 大方向 + 只做趋势（1H 趋势效率≥{cfg['min_trend_eff_1h']:.0%}）｜止损在买卖点外 0.5 ATR，反向买卖点离场｜
 每笔每 1 倍扣 {cfg['fee_per_unit']}U，不计滑点｜每 5 分钟运行｜开始于 {bj(first)}｜更新于 {datetime.now(TZ):%m-%d %H:%M:%S}</div>
 <div class="grid">
@@ -295,6 +371,26 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
     (ROOT / "web" / "index.html").write_text(html, encoding="utf-8")
 
 
+LOCK = ROOT / "trader15.lock"
+
+
+def run_locked():
+    """同一时间只允许一个实例（定时器和看门狗可能同时触发）；超过 5 分钟的锁视为上次异常退出留下的，直接清掉。"""
+    import os
+    try:
+        if LOCK.exists() and time.time() - LOCK.stat().st_mtime > 300:
+            LOCK.unlink()
+        fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        log.info("已有实例在运行，本次跳过")
+        return
+    try:
+        os.write(fd, str(os.getpid()).encode()); os.close(fd)
+        run_once()
+    finally:
+        LOCK.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     setup_logging()
-    {"run": run_once, "report": report}.get(sys.argv[1] if len(sys.argv) > 1 else "run", run_once)()
+    {"run": run_locked, "report": report}.get(sys.argv[1] if len(sys.argv) > 1 else "run", run_locked)()

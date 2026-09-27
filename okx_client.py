@@ -1,28 +1,42 @@
 """OKX 公共行情接口（无需 API Key）。"""
+import random
 import time
 import requests
 import pandas as pd
 
 BASE = "https://www.okx.com"
 _session = requests.Session()
+# 可重试的 OKX 错误码：50011 限频、50001 服务暂不可用、50004 接口超时、50013 系统繁忙、50026 系统错误
+RETRY_CODES = {"50011", "50001", "50004", "50013", "50026"}
 
 
-def get(path, params=None, retries=3):
+def get(path, params=None, retries=5):
+    """网络异常 / 5xx / 可重试错误码时按指数退避重试（1, 2, 4, 8… 秒，最长 20 秒，带随机抖动）。"""
+    last = None
     for i in range(retries):
         try:
             r = _session.get(BASE + path, params=params, timeout=15)
+            if r.status_code >= 500:
+                raise requests.HTTPError(f"HTTP {r.status_code}")
             j = r.json()
             if j.get("code") == "0":
                 return j["data"]
-            if j.get("code") == "50011":  # 限频
-                time.sleep(1 + i)
-                continue
-            raise RuntimeError(f"{path} {params} -> {j.get('code')} {j.get('msg')}")
-        except (requests.RequestException, ValueError):
-            if i == retries - 1:
-                raise
-            time.sleep(1 + i)
-    raise RuntimeError(f"{path} 请求失败")
+            if j.get("code") not in RETRY_CODES:
+                raise RuntimeError(f"{path} {params} -> {j.get('code')} {j.get('msg')}")
+            last = RuntimeError(f"{path} -> {j.get('code')} {j.get('msg')}")
+        except (requests.RequestException, ValueError) as e:
+            last = e
+        if i < retries - 1:
+            time.sleep(min(2 ** i, 20) + random.random())
+    raise RuntimeError(f"{path} 重试 {retries} 次仍失败：{last}")
+
+
+def reachable():
+    """检测能否连上 OKX（服务器时间接口）。"""
+    try:
+        return bool(get("/api/v5/public/time", retries=3))
+    except Exception:
+        return False
 
 
 def instrument(inst_id):
