@@ -37,7 +37,7 @@ def task15(T):
     bis = ch["bis"]
     last_bot = next(((b["end"], b["low"]) for b in reversed(bis) if not b["up"]), None)   # 最近一笔向下笔的终点（底）
     last_top = next(((b["end"], b["high"]) for b in reversed(bis) if b["up"]), None)
-    return T, {"fresh": fresh, "close": float(s.c.iloc[-1]), "atr": float(ta.atr(s).iloc[-1]),
+    return T, {"fresh": fresh, "close": float(s.c.iloc[-1]), "atr": float(ta.atr(s).iloc[-1]), "trend15": ch["trend"],
                "bot": (int(s.ts.iloc[last_bot[0]]), last_bot[1]) if last_bot else None,
                "top": (int(s.ts.iloc[last_top[0]]), last_top[1]) if last_top else None}
 
@@ -51,7 +51,12 @@ def task1h(T):
         return T, None
     r1, _, _ = ta.analyze_tf(s1, "1H", 2.0)
     r4, _, _ = ta.analyze_tf(s4, "4H", 2.0)
-    return T, {"trend": 0.6 * r1["trend_score"] + 0.4 * r4["trend_score"], "bias": chan.bias(chan.analyze(s1))}
+    ch1 = chan.analyze(s1)
+    c = s1.c.values[-49:]
+    eff = abs(c[-1] - c[0]) / (abs(pd.Series(c).diff()).sum() or 1)      # 近 48 根 1H 的趋势效率
+    return T, {"trend": 0.6 * r1["trend_score"] + 0.4 * r4["trend_score"], "bias": chan.bias(ch1),
+               "trend1h_chan": ch1["trend"], "adx4h": r4["adx"]["adx"], "adx1h": r1["adx"]["adx"],
+               "regime1h": r1["regime"], "regime4h": r4["regime"], "eff1h": float(eff)}
 
 
 def precompute(inst, days):
@@ -109,6 +114,20 @@ def simulate(Ts, p15, p1h, b5, unit, v, fee=2.0):
                 if v["nest"] and hr and hr["bias"] * side < 0:
                     continue
                 if v.get("nest_strict") and (not hr or hr["bias"] * side <= 0):
+                    continue
+                # 行情性质过滤：只做趋势
+                want_tr = "上涨" if side > 0 else "下跌"
+                if v.get("chan15_trend") and info["trend15"] != want_tr:
+                    continue
+                if v.get("chan1h_trend") and (not hr or hr["trend1h_chan"] != want_tr):
+                    continue
+                if v.get("adx4h_min") and (not hr or hr["adx4h"] < v["adx4h_min"]):
+                    continue
+                if v.get("regime1h_single") and (not hr or hr["regime1h"] != "单边"):
+                    continue
+                if v.get("regime4h_single") and (not hr or hr["regime4h"] != "单边"):
+                    continue
+                if v.get("eff1h_min") and (not hr or hr["eff1h"] < v["eff1h_min"]):
                     continue
                 entry = info["close"]
                 stop = px - side * v["stop_buf"] * info["atr"]
@@ -195,12 +214,24 @@ OPT_VARIANTS = [
     ("只改：大方向必须同向（趋势分≥1）", {"trend_min": 1.0}),
     ("只改：1H 缠论方向必须同向", {"nest_strict": True}),
 ]
+REGIME_VARIANTS = [
+    ("主策略（区间套+大方向+只做三类）", {}),
+    ("①只改：15m 缠论走势为同向趋势", {"chan15_trend": True}),
+    ("②只改：1H 缠论走势为同向趋势", {"chan1h_trend": True}),
+    ("③只改：4H ADX≥20", {"adx4h_min": 20}),
+    ("④只改：4H ADX≥25", {"adx4h_min": 25}),
+    ("⑤只改：1H 行情性质=单边", {"regime1h_single": True}),
+    ("⑥只改：4H 行情性质=单边", {"regime4h_single": True}),
+    ("⑦只改：1H 趋势效率≥15%", {"eff1h_min": 0.15}),
+    ("⑧只改：1H 趋势效率≥25%", {"eff1h_min": 0.25}),
+]
 
 
 def main():
     days = int(sys.argv[1]) if len(sys.argv) > 1 else 60
     suite = sys.argv[2] if len(sys.argv) > 2 else "base"
-    variants = [(n, {**MAIN, **d}) for n, d in OPT_VARIANTS] if suite == "opt" else VARIANTS
+    variants = ([(n, {**MAIN, **d}) for n, d in OPT_VARIANTS] if suite == "opt" else
+                [(n, {**MAIN, **d}) for n, d in REGIME_VARIANTS] if suite == "regime" else VARIANTS)
     rows = []
     for inst, unit in (("ETH-USDT-SWAP", 1.0), ("BTC-USDT-SWAP", 0.03)):
         t0 = datetime.now()

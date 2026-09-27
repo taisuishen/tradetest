@@ -5,6 +5,8 @@
   入场：15m 新确认的三买做多 / 三卖做空，按当前价成交（不计滑点），每次 1 倍仓位，不加仓
   过滤：① 大方向：1H*0.6 + 4H*0.4 趋势分不能明显相反（多单要求 > -1，空单要求 < +1）
         ② 区间套：1H 缠论方向（走势 + 近期买卖点）不能相反
+        ③ 行情性质：只做趋势——1H 近 48 根 K 线趋势效率（净涨跌 / 逐根涨跌绝对值之和）≥ 25%，
+           震荡行情里的突破不做（120 天回测：回撤 246U→138U，9 月由 −111U 转为 +37U）
   止损：买卖点价格外 0.5 ATR(15m)；用 1 分钟 K 线高低点逐根判定，按止损价原价成交
   离场：止损，或持仓中 15m 出现反向买卖点（按当时价格平仓）；不设固定止盈
   手续费：每笔平仓每 1 倍扣 2U（ETH 1 个 / BTC 0.03 个）
@@ -36,6 +38,7 @@ DEFAULT_CFG = {
     "trend_filter": True,
     "trend_threshold": 1.0,
     "nest_filter": True,
+    "min_trend_eff_1h": 0.25,  # 1H 趋势效率下限，0 表示不过滤
     "stop_buffer_atr": 0.5,
     "fresh_bars": 3,            # 买卖点确认后多少根 15m 内还算“新”
 }
@@ -157,7 +160,13 @@ def handle(con, cfg, inst, unit):
     trend = 0.6 * r1["trend_score"] + 0.4 * r4["trend_score"]
     ch1 = chan.analyze(df1h); bias = chan.bias(ch1)
     atr = float(ta.atr(df15).iloc[-1])
+    c48 = df1h.c.values[-49:]
+    eff = abs(c48[-1] - c48[0]) / (sum(abs(c48[i] - c48[i - 1]) for i in range(1, len(c48))) or 1)
     notes = []
+    if eff < cfg["min_trend_eff_1h"]:
+        signal(con, inst, price, "放弃", f"{'、'.join(c[0] for c in cands)}：1H 趋势效率 {eff:.0%} < {cfg['min_trend_eff_1h']:.0%}，"
+                                        f"行情在震荡，不做震荡里的突破")
+        return
     for tp, ts_, px in cands:
         side = 1 if tp in LONG else -1
         if cfg["trend_filter"] and trend * side <= -cfg["trend_threshold"]:
@@ -168,14 +177,15 @@ def handle(con, cfg, inst, unit):
         if (stop - price) * side >= 0:
             notes.append(f"{tp}（{px:.6g}）已被价格打穿，结构失效"); continue
         ts_now = now_ms()
-        ctx = {"trend": round(trend, 2), "chan1h_trend": ch1["trend"], "chan1h_bias": bias, "atr15": round(atr, 6)}
+        ctx = {"trend": round(trend, 2), "chan1h_trend": ch1["trend"], "chan1h_bias": bias, "atr15": round(atr, 6),
+               "trend_eff_1h": round(eff, 3)}
         cur = con.execute("""insert into trades(inst, side, point, point_ts, point_px, qty, mult, entry_ts, entry_px, stop,
                              last_checked_ts, context) values(?,?,?,?,?,?,?,?,?,?,?,?)""",
                           (inst, "long" if side > 0 else "short", tp, ts_, px, unit, 1.0, ts_now, price, stop,
                            ts_now // 60_000 * 60_000 + 60_000, json.dumps(ctx, ensure_ascii=False)))
         con.commit()
         signal(con, inst, price, "开仓", f"#{cur.lastrowid} {tp}{'做多' if side > 0 else '做空'} @{price:.6g}（买卖点 {px:.6g}），"
-                                        f"止损 {stop:.6g}，风险 {abs(price - stop) * unit:.2f}U；大方向 {trend:+.2f}，1H 缠论{ch1['trend']}")
+                                        f"止损 {stop:.6g}，风险 {abs(price - stop) * unit:.2f}U；大方向 {trend:+.2f}，1H 缠论{ch1['trend']}，1H 趋势效率 {eff:.0%}")
         return
     signal(con, inst, price, "放弃", "；".join(notes))
 
@@ -266,7 +276,7 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
 .curve{{width:100%;height:170px}} .curve path{{fill:none;stroke-width:2}} .lu{{stroke:var(--up)}} .ld{{stroke:var(--down)}} .zero{{stroke:var(--line);stroke-dasharray:4 4}}
 </style></head><body>
 <h1>15 分钟级缠论模拟交易</h1>
-<div class="muted">只模拟，不下真实单｜15m 三买 / 三卖入场，区间套（1H 缠论）+ 大方向过滤｜止损在买卖点外 0.5 ATR，反向买卖点离场｜
+<div class="muted">只模拟，不下真实单｜15m 三买 / 三卖入场，区间套（1H 缠论）+ 大方向 + 只做趋势（1H 趋势效率≥{cfg['min_trend_eff_1h']:.0%}）｜止损在买卖点外 0.5 ATR，反向买卖点离场｜
 每笔每 1 倍扣 {cfg['fee_per_unit']}U，不计滑点｜每 5 分钟运行｜开始于 {bj(first)}｜更新于 {datetime.now(TZ):%m-%d %H:%M:%S}</div>
 <div class="grid">
 <div class="kpi"><span>胜率</span><b>{s['wr']:.1f}%</b><span>{s['w']} 胜 / {s['l']} 负</span></div>
