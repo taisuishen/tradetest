@@ -16,3 +16,4 @@ heartbeat.json
 okx_api.json
 fee_rates.json
 *.err
+cache/
