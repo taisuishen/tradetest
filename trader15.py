@@ -240,8 +240,7 @@ def handle(con, cfg, inst, unit):
             continue
         con.execute("insert into used_points values(?,?,?)", (inst, tp, ts_)); con.commit()
         cands.append((tp, ts_, px))
-    if not cands:
-        signal(con, inst, price, "观望", "15m 没有新的三买 / 三卖")
+    if not cands:          # 没有新信号：不记录（心跳照常更新，看板顶部可确认程序在运行）
         return
     df1h = ox.candles(inst, "1H", 400); df4h = ox.candles(inst, "4H", 300)
     r1, _, _ = ta.analyze_tf(df1h, "1H", 2.0); r4, _, _ = ta.analyze_tf(df4h, "4H", 2.0)
