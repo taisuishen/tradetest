@@ -49,7 +49,7 @@ def main():
         if r is not None:
             wlog(f"重启 paper-trader.service：{'成功' if r.returncode == 0 else r.stderr.strip()}")
         elif os.name == "nt":
-            kill_windows_trader(hb.get("pid"))
+            kill_windows_trader()
             start_windows_loop()
         else:
             subprocess.Popen([sys.executable, str(ROOT / "trader15.py"), "loop"], cwd=ROOT, start_new_session=True,
@@ -75,15 +75,17 @@ def _pyw():
     return str(pyw if pyw.exists() else sys.executable)
 
 
-def kill_windows_trader(pid):
-    """只结束命令行里确实包含 trader15.py 的那个进程，避免误杀。"""
-    if not pid:
-        return
-    ps = (f"$p = Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}'; "
-          "if ($p -and $p.CommandLine -match 'trader15.py') { Stop-Process -Id $p.ProcessId -Force; 'killed' }")
+def kill_windows_trader():
+    """心跳超时时结束所有卡死的常驻进程（只结束命令行确实是 trader15.py loop 的，避免误杀），
+    它们持有的系统文件锁随之释放，新进程才能启动。"""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe' or Name='pythonw.exe'\" | "
+          "Where-Object { $_.CommandLine -like '*trader15.py* loop*' } | "
+          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }")
     r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=30)
-    if "killed" in r.stdout:
-        wlog(f"已结束卡死的旧进程 PID {pid}")
+    pids = r.stdout.split()
+    if pids:
+        wlog(f"已结束卡死的旧进程 PID {', '.join(pids)}")
+        time.sleep(2)
 
 
 def start_windows_loop():

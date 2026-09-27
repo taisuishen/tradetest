@@ -19,6 +19,7 @@
 """
 import json
 import logging
+import os
 import sqlite3
 import sys
 import time
@@ -426,51 +427,90 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
 
 
 LOCK = ROOT / "trader15.lock"
+_LOCK_FH = [None]
+
+
+def acquire_lock():
+    """操作系统级文件锁（Linux flock / Windows msvcrt.locking）：进程一旦退出或被杀，锁由系统立即释放，
+    不会留下“假锁”，也不需要靠 PID 或心跳去猜另一个实例是否还活着。成功返回 True。"""
+    import os
+    fh = open(LOCK, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return False
+    _LOCK_FH[0] = fh
+    return True
+
+
+def release_lock():
+    fh = _LOCK_FH[0]
+    if fh:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        fh.close()
+        _LOCK_FH[0] = None
 
 
 def run_locked():
-    """同一时间只允许一个实例（定时器和看门狗可能同时触发）；超过 5 分钟的锁视为上次异常退出留下的，直接清掉。"""
-    import os
-    try:
-        if LOCK.exists() and time.time() - LOCK.stat().st_mtime > 300:
-            LOCK.unlink()
-        fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        if not _MODE.get("loop"):
-            log.info("已有实例在运行，本次跳过")
+    """只跑一轮；如果常驻进程或另一个单次运行正在进行，就跳过。"""
+    if not acquire_lock():
+        log.info("已有实例在运行，本次跳过")
         return
     try:
-        os.write(fd, str(os.getpid()).encode()); os.close(fd)
         run_once()
     finally:
-        LOCK.unlink(missing_ok=True)
+        release_lock()
 
 
 def loop():
     """常驻模式：算完一轮马上接着算（loop_interval_sec 为两轮之间的最短间隔，默认 1 秒，0 表示完全不停）。
-    单轮出错只记录不退出；进程本身挂掉由 systemd Restart=always / Windows 计划任务 / 看门狗拉起。"""
-    import os
-    cfg = load_cfg()
-    hb = read_heartbeat()
-    if hb.get("pid") and hb["pid"] != os.getpid() and hb.get("mode") == "loop" and now_ms() - hb.get("last_run_ts", 0) < 60_000:
-        log.info(f"已有常驻进程在运行（PID {hb['pid']}，心跳 {(now_ms() - hb['last_run_ts']) / 1000:.0f} 秒前），本进程退出")
+    整个进程生命周期持有系统文件锁，保证只有一个常驻实例；单轮出错只记录不退出；
+    进程本身挂掉由 systemd Restart=always / 看门狗拉起。"""
+    if not acquire_lock():
+        log.info("已有常驻进程或单次运行正在进行（系统文件锁被占用），本进程退出")
         return
+    cfg = load_cfg()
     _MODE["loop"] = True
     log.info(f"常驻循环启动（PID {os.getpid()}，每轮最短间隔 {cfg.get('loop_interval_sec', 1)} 秒）")
     n = 0
     while True:
         t0 = time.time()
         try:
-            run_locked()
+            run_once()
         except Exception as e:                     # 不让任何异常把循环带走
             log.error(f"本轮异常：{e}\n{traceback.format_exc()}")
             time.sleep(5)
         n += 1
-        if n % 600 == 0:
+        if n % 3600 == 0:
             log.info(f"常驻循环已运行 {n} 轮")
         time.sleep(max(0.0, float(load_cfg().get("loop_interval_sec", 1)) - (time.time() - t0)))
 
 
 if __name__ == "__main__":
+    import atexit
+    import faulthandler
+    if sys.stderr is None:           # pythonw（Windows 后台运行）没有 stderr：崩溃信息写到文件，避免“无声退出”
+        sys.stderr = open(ROOT / "trader15.err", "a", encoding="utf-8", buffering=1)
+    faulthandler.enable(sys.stderr)  # 连解释器级的硬崩溃也能留下调用栈
     setup_logging()
-    {"run": run_locked, "report": report, "loop": loop}.get(sys.argv[1] if len(sys.argv) > 1 else "run", run_locked)()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
+    if cmd == "loop":
+        atexit.register(lambda: log.info(f"常驻进程退出（PID {os.getpid()}）"))
+    try:
+        {"run": run_locked, "report": report, "loop": loop}.get(cmd, run_locked)()
+    except BaseException as e:       # 包括 KeyboardInterrupt / SystemExit，记下退出原因
+        log.error(f"进程异常退出：{type(e).__name__} {e}\n{traceback.format_exc()}")
+        raise

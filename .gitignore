@@ -15,3 +15,4 @@ heartbeat.json
 *.lock
 okx_api.json
 fee_rates.json
+*.err
