@@ -126,6 +126,8 @@ def sig_trend(info, hr, v, used):
                 continue                               # 大盘（BTC 1H/4H）不同向
         if v.get("skip_hours") and (T_NOW[0] // H + 8) % 24 in v["skip_hours"]:
             continue                               # 北京时间某些时段不做
+        if v.get("gate") and not v["gate"](T_NOW[0], side, info, hr):
+            continue                                   # 外部过滤（如 TradeTrack 多周期指标 / 支撑压力，见 bt_ttrack.py）
         if v.get("stop_mode") == "zs" and info["zs"]:
             stop = (info["zs"]["zg"] if side > 0 else info["zs"]["zd"]) - side * 0.2 * info["atr"]
         else:
@@ -264,6 +266,8 @@ def simulate(d, v, t_from=None, t_to=None):
                 opp = next((t for t, ts_, _ in info["fresh"] if t in want and ts_ > pos["point_ts"] and ts_ >= pos["ts"] - 45 * 60_000), None)
                 if opp:
                     close(info["close"], T, "反向" + opp, fm["taker"]); pos = None
+            if pos and pv.get("tt_exit") is not None and info.get("tt") and info["tt"]["1H"]["score"] * pos["side"] < pv["tt_exit"]:
+                close(info["close"], T, "转向", fm["taker"]); pos = None      # TradeTrack 1H 评分转向（见 bt_ttrack.py）
             if pos and pv.get("max_bars") and pos["bars"] >= pv["max_bars"]:
                 close(info["close"], T, "超时", fm["taker"]); pos = None
         # 2) 找新信号
@@ -359,6 +363,21 @@ def compare(data, variants, recent=30, total=90):
         sa, sb = stats(a, recent), stats(b, total - recent)
         rows.append({"方案": name, **{f"上月{k}": x for k, x in sa.items()}, "|": "|", **{f"验证{k}": x for k, x in sb.items() if k in ("笔数", "周", "胜率%", "净利", "去前5", "回撤")}})
     return pd.DataFrame(rows)
+
+
+def compound(df, frac=1.0, tz="Asia/Shanghai"):
+    """按开平仓事件顺序复利：开仓时名义 = 已实现权益 × frac，平仓时权益 += 名义 × 这笔收益率（df.ret）。
+    返回 (逐笔平仓后的权益曲线 DataFrame[ts, eq, 月], 最多同时持仓)。"""
+    ev = sorted([(r.ts, 1, k) for k, r in df.iterrows()] + [(r.end, 0, k) for k, r in df.iterrows()], key=lambda x: (x[0], x[1]))
+    eq, notional, curve, n, mx = 1.0, {}, [], 0, 0
+    for ts, is_open, k in ev:
+        if is_open:
+            notional[k] = eq * frac; n += 1; mx = max(mx, n)
+        else:
+            eq += notional[k] * df.at[k, "ret"]; n -= 1; curve.append((ts, eq))
+    cv = pd.DataFrame(curve, columns=["ts", "eq"])
+    cv["月"] = pd.to_datetime(cv.ts, unit="ms", utc=True).dt.tz_convert(tz).dt.strftime("%Y-%m")
+    return cv, mx
 
 
 if __name__ == "__main__":

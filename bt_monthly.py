@@ -43,18 +43,7 @@ def job(args):
     return t
 
 
-def compound(df):
-    """按事件顺序：开仓时名义 = 已实现权益，平仓时权益 += 名义 × 收益率。返回 (逐笔平仓后的权益曲线, 最多同时持仓)。"""
-    ev = sorted([(r.ts, 1, k) for k, r in df.iterrows()] + [(r.end, 0, k) for k, r in df.iterrows()], key=lambda x: (x[0], x[1]))
-    eq, notional, curve, n, mx = 1.0, {}, [], 0, 0
-    for ts, is_open, k in ev:
-        if is_open:
-            notional[k] = eq; n += 1; mx = max(mx, n)
-        else:
-            eq += notional[k] * df.at[k, "ret"]; n -= 1; curve.append((ts, eq))
-    cv = pd.DataFrame(curve, columns=["ts", "eq"])
-    cv["月"] = pd.to_datetime(cv.ts, unit="ms", utc=True).dt.tz_convert(TZ).dt.strftime("%Y-%m")
-    return cv, mx
+compound = L.compound
 
 
 if __name__ == "__main__":
