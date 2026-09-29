@@ -25,6 +25,7 @@
 用法：python trader15.py loop     常驻：算完一轮马上接着算（部署默认方式）
       python trader15.py run      只跑一轮
       python trader15.py report   统计
+      python trader15.py test-alert   发一条测试告警（检查 Telegram / 群机器人配置）
 """
 import json
 import logging
@@ -214,17 +215,31 @@ _LAST_DASH = [0.0]
 
 
 def alert(cfg, text):
-    """推送告警；失败只记日志，不影响交易逻辑。"""
+    """推送告警（钉钉 / 企业微信群机器人、Telegram，各自独立）；失败只记日志，不影响交易逻辑。
+    返回 True 全部成功 / False 有渠道失败 / None 没有配置任何渠道。"""
     import requests
     text = f"【{_CFG.get('_live') or '模拟交易'}】{text}"
-    try:
-        if cfg.get("alert_webhook"):   # 钉钉 / 企业微信群机器人通用格式
-            requests.post(cfg["alert_webhook"], json={"msgtype": "text", "text": {"content": text}}, timeout=10)
-        if cfg.get("telegram_bot_token") and cfg.get("telegram_chat_id"):
-            requests.post(f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/sendMessage",
-                          json={"chat_id": cfg["telegram_chat_id"], "text": text}, timeout=10)
-    except Exception as e:
-        log.error(f"告警推送失败：{e}")
+    sent = []
+    if cfg.get("alert_webhook"):       # 钉钉 / 企业微信群机器人通用格式
+        try:
+            r = requests.post(str(cfg["alert_webhook"]).strip(), json={"msgtype": "text", "text": {"content": text}}, timeout=10)
+            ok = r.ok and r.json().get("errcode", 0) == 0
+            if not ok:                 # 请求发出去了但对方拒收（地址错、关键词不匹配等）：写日志，不然会悄悄失败
+                log.error(f"告警推送失败（群机器人）：HTTP {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            ok = False; log.error(f"告警推送失败（群机器人）：{e}")
+        sent.append(ok)
+    if cfg.get("telegram_bot_token") and cfg.get("telegram_chat_id"):
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{str(cfg['telegram_bot_token']).strip()}/sendMessage",
+                              json={"chat_id": str(cfg["telegram_chat_id"]).strip(), "text": text}, timeout=10)
+            ok = r.ok
+            if not ok:                 # 401 Token 错 / 400 chat not found / 403 没给机器人发过消息
+                log.error(f"告警推送失败（Telegram）：HTTP {r.status_code} {r.text[:200]}")
+        except Exception as e:
+            ok = False; log.error(f"告警推送失败（Telegram，服务器可能连不上 Telegram）：{e}")
+        sent.append(ok)
+    return all(sent) if sent else None
 
 
 def read_heartbeat():
@@ -762,6 +777,13 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
     (ROOT / "web" / "index.html").write_text(html, encoding="utf-8")
 
 
+def test_alert():
+    """python trader15.py test-alert：发一条测试告警，并打印每个渠道的结果。"""
+    cfg = load_cfg(); _CFG.update(cfg)
+    r = alert(cfg, "测试消息：告警推送已接通")
+    print({True: "✅ 推送成功，请查看手机", False: "❌ 推送失败，原因见上面的日志", None: "没有配置任何推送渠道（alert_webhook 或 telegram_*）"}[r])
+
+
 LOCK = ROOT / "trader15.lock"
 _LOCK_FH = [None]
 
@@ -846,7 +868,7 @@ if __name__ == "__main__":
     if cmd == "loop":
         atexit.register(lambda: log.info(f"常驻进程退出（PID {os.getpid()}）"))
     try:
-        {"run": run_locked, "report": report, "loop": loop}.get(cmd, run_locked)()
+        {"run": run_locked, "report": report, "loop": loop, "test-alert": test_alert}.get(cmd, run_locked)()
     except BaseException as e:       # 包括 KeyboardInterrupt / SystemExit，记下退出原因
         log.error(f"进程异常退出：{type(e).__name__} {e}\n{traceback.format_exc()}")
         raise
