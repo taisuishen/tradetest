@@ -113,7 +113,13 @@ def migrate_cfg(raw):
 def load_cfg():
     if not CFG_PATH.exists():
         CFG_PATH.write_text(json.dumps(DEFAULT_CFG, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {**DEFAULT_CFG, **migrate_cfg(CFG_PATH.read_text(encoding="utf-8"))}
+    user = migrate_cfg(CFG_PATH.read_text(encoding="utf-8"))
+    missing = [k for k in DEFAULT_CFG if k not in user]
+    if missing:                # 新版本新增的设置项写进配置文件（取默认值），方便直接打开修改；已有的值不动
+        user.update({k: DEFAULT_CFG[k] for k in missing})
+        CFG_PATH.write_text(json.dumps(user, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info(f"配置文件补充新设置项（默认值）：{'、'.join(missing)}")
+    return {**DEFAULT_CFG, **user}
 
 
 def db():
