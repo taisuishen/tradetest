@@ -1,11 +1,11 @@
 """
 15 分钟级缠论单仓交易（默认只模拟；live_trading=true 时同步下单到 OKX）。
 
-规则 v3（chan15_lab2.py 控制变量测试：8 个品种、窄中枢、多空都做）：
+规则 v4（chan15_lab2.py 控制变量测试 + bt_monthly.py 按月回测：8 个品种、窄中枢、只做多）：
   品种：ETH / BTC / SOL / XRP / DOGE / SUI / ZEC / HYPE，每个品种各自一个仓位，1 倍 ≈ 2500U 名义价值
-  入场：15m 新确认的三买做多、三卖做空，按当前价成交（不计滑点），不加仓
-        （180 天回测：空单在涨势里小亏、跌势里大赚，6 月 BTC −21% 时多空 +27.7%、只做多 +4.9%；
-          6 个月复利多空 +161.7% / 回撤 20.5%，只做多 +141.0% / 回撤 17.1%）
+  入场：15m 新确认的三买做多，按当前价成交（不计滑点），不加仓；不做空
+        （2025 全年样本外回测：空单 145 笔全年 −34%，连 BTC −17% 的 11 月也亏；只做多 +83% / 回撤 24.8%。
+          v3 曾多空都做，只因 2026-06 一个月空单有效，不稳健，已撤回）
   仓位：固定 1 倍（与回测一致）；sizing=step 可改回按评分分档 0.5 / 1 / 2 / 3 / 5 倍（sizing.py）
   过滤：① 大方向：1H*0.6 + 4H*0.4 趋势分不能明显相反（多单要求 > -1，空单要求 < +1）
         ② 区间套：1H 缠论方向（走势 + 近期买卖点）不能相反
@@ -43,7 +43,7 @@ import ta  # noqa: E402
 
 TZ = timezone(timedelta(hours=8))
 CFG_PATH = ROOT / "trader15_config.json"
-STRATEGY_VERSION = 3
+STRATEGY_VERSION = 4
 DEFAULT_CFG = {
     "strategy_version": STRATEGY_VERSION,
     # 1 倍 ≈ 2500U 名义价值（按 2026-09 价格折算）
@@ -52,7 +52,7 @@ DEFAULT_CFG = {
                     "ZEC-USDT-SWAP": {"unit": 1.8}, "HYPE-USDT-SWAP": {"unit": 28}},
     "fee_mode": "okx",          # okx：成交金额 × OKX 吃单费率 + 实际资金费（见 fees.py）；fixed：每 1 倍固定 fee_per_unit
     "fee_per_unit": 2.0,
-    "entry_points": ["三买", "三卖"],   # 多空都做；只写 "三买" 就只做多
+    "entry_points": ["三买"],   # 只做多；加上 "三卖" 就多空都做（2025 年回测空单全年亏损，不建议）
     "trend_filter": True,
     "trend_threshold": 1.0,
     "nest_filter": True,
@@ -68,7 +68,7 @@ DEFAULT_CFG = {
     "telegram_chat_id": "",
     "alert_after_errors": 3,    # 连续失败几次运行才告警
     "alert_trades": False,      # 开仓 / 平仓时是否也推送
-    # OKX 下单（见 okx_trade.py）：模拟交易照常运行并做决策，开启后每笔开平仓同步到 OKX；一律逐仓，多空都做
+    # OKX 下单（见 okx_trade.py）：模拟交易照常运行并做决策，开启后每笔开平仓同步到 OKX；一律逐仓（多空方向都支持）
     "live_trading": False,      # true：同步下单到 OKX（需 okx_api.json 里的交易权限 Key）
     "live_leverage": 10,        # 逐仓杠杆（10 倍：强平约在开仓价下方 9.5%，回测里所有止损都在强平之前）
     "live_sizing": "equity",    # equity：每笔名义价值 = 开仓时 OKX 账户 USDT 权益 × live_equity_frac；fixed：模拟仓位数量 × live_size_factor
@@ -100,8 +100,8 @@ STRATEGY_KEYS = ("instruments", "entry_points", "min_trend_eff_1h", "max_zs_widt
 
 def migrate_cfg(raw):
     """旧版配置升级到当前策略，先备份旧配置。
-    v1 → 当前：覆盖全部策略项，旧成交记录归档到 trader15_v1.db，新策略从零开始统计（v1 与 v2 规则差别很大）。
-    v2 → v3：只把入场点改为多空都做；不归档成交记录（v2 可能已有 OKX 持仓在跟踪，归档会让它们没人管）。"""
+    v1 → 当前：覆盖全部策略项（v1 与之后的规则差别很大）。v2 / v3 → 当前：只改入场点（v4 为只做多）。
+    已平仓记录归档到 trader15_v{旧版本}.db，新策略从零开始统计；未平仓位（含 OKX 上在跟踪的）带到新库继续管理。"""
     user = json.loads(raw)
     old = user.get("strategy_version", 1)
     if old >= STRATEGY_VERSION:
@@ -116,7 +116,7 @@ def migrate_cfg(raw):
     if old < 2:
         user.update({k: DEFAULT_CFG[k] for k in STRATEGY_KEYS})
     else:
-        user["entry_points"] = DEFAULT_CFG["entry_points"]        # v2 → v3：只改为多空都做
+        user["entry_points"] = DEFAULT_CFG["entry_points"]        # v2 / v3 → 当前：只改入场点
     user["strategy_version"] = STRATEGY_VERSION
     CFG_PATH.write_text(json.dumps(user, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info(f"策略升级 v{old} → v{STRATEGY_VERSION}：{note}")
