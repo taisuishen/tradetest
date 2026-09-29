@@ -46,6 +46,7 @@ import okx_client as ox  # noqa: E402
 import fees  # noqa: E402
 import sizing  # noqa: E402
 import ta  # noqa: E402
+import notify  # noqa: E402
 
 TZ = timezone(timedelta(hours=8))
 CFG_PATH = ROOT / "trader15_config.json"
@@ -199,7 +200,8 @@ def bj(ts):
 QUIET = {"观望", "持仓", "放弃"}   # 每分钟都在重复的状态：同类记录最多 5 分钟记一条，免得刷屏
 
 
-def signal(con, inst, price, decision, detail):
+def signal(con, inst, price, decision, detail, push=None):
+    """记一条分析记录（看板 / 日志用一行文字）；开仓、平仓、实盘类事件按需推送，push 为排好版的推送卡片。"""
     if decision in QUIET:
         last = con.execute("select ts, decision, detail from signals where inst=? order by ts desc limit 1", (inst,)).fetchone()
         if last and last["decision"] == decision and now_ms() - last["ts"] < 300_000 and (decision != "放弃" or last["detail"] == detail):
@@ -207,7 +209,7 @@ def signal(con, inst, price, decision, detail):
     con.execute("insert into signals values(?,?,?,?,?)", (now_ms(), inst, price, decision, detail)); con.commit()
     log.info(f"[{inst}] {decision}：{detail}")
     if decision in ("开仓", "平仓", "实盘") and _CFG.get("alert_trades"):
-        alert(_CFG, f"[{inst}] {decision}：{detail}")
+        alert(_CFG, push, card=True) if push else alert(_CFG, f"[{inst}] {decision}：{detail}")
 
 
 _CFG = {}
@@ -215,15 +217,21 @@ _MODE = {}
 _LAST_DASH = [0.0]
 
 
-def alert(cfg, text):
+def _mode():
+    return _CFG.get("_live") or _CFG.get("_live_manage") or "模拟交易"
+
+
+def alert(cfg, text, card=False):
     """推送告警（钉钉 / 企业微信群机器人、Telegram，各自独立）；失败只记日志，不影响交易逻辑。
+    card=True 表示 text 是 notify.py 排好版的卡片（HTML）；否则按普通文字加上来源前缀。
     返回 True 全部成功 / False 有渠道失败 / None 没有配置任何渠道。"""
     import requests
-    text = f"【{_CFG.get('_live') or '模拟交易'}】{text}"
+    if not card:
+        text = f"<b>【{notify.esc(_mode())}】</b>\n{notify.esc(text)}"
     sent = []
     if cfg.get("alert_webhook"):       # 钉钉 / 企业微信群机器人通用格式
         try:
-            r = requests.post(str(cfg["alert_webhook"]).strip(), json={"msgtype": "text", "text": {"content": text}}, timeout=10)
+            r = requests.post(str(cfg["alert_webhook"]).strip(), json={"msgtype": "text", "text": {"content": notify.plain(text)}}, timeout=10)
             ok = r.ok and r.json().get("errcode", 0) == 0
             if not ok:                 # 请求发出去了但对方拒收（地址错、关键词不匹配等）：写日志，不然会悄悄失败
                 log.error(f"告警推送失败（群机器人）：HTTP {r.status_code} {r.text[:200]}")
@@ -233,7 +241,8 @@ def alert(cfg, text):
     if cfg.get("telegram_bot_token") and cfg.get("telegram_chat_id"):
         try:
             r = requests.post(f"https://api.telegram.org/bot{str(cfg['telegram_bot_token']).strip()}/sendMessage",
-                              json={"chat_id": str(cfg["telegram_chat_id"]).strip(), "text": text}, timeout=10)
+                              json={"chat_id": str(cfg["telegram_chat_id"]).strip(), "text": text, "parse_mode": "HTML",
+                                    "disable_web_page_preview": True}, timeout=10)
             ok = r.ok
             if not ok:                 # 401 Token 错 / 400 chat not found / 403 没给机器人发过消息
                 log.error(f"告警推送失败（Telegram）：HTTP {r.status_code} {r.text[:200]}")
@@ -363,7 +372,8 @@ def live_open(con, cfg, tid, inst, side, qty, stop):
         n = con.execute("select count(*) from trades where live_status in ('open', 'opening')").fetchone()[0]
         if n >= cap:
             con.execute("update trades set live_status='skipped', live_note=? where id=?", (f"OKX 已有 {n} 笔持仓，达到上限 {cap}", tid)); con.commit()
-            signal(con, inst, None, "实盘", f"#{tid} OKX 已有 {n} 笔持仓，达到 live_max_positions={cap}，这笔只做模拟")
+            signal(con, inst, None, "实盘", f"#{tid} OKX 已有 {n} 笔持仓，达到 live_max_positions={cap}，这笔只做模拟",
+                   notify.info_card("⏸", "OKX 同时持仓已达上限", inst, [f"已有 {n} 笔持仓（上限 {cap}）", "这笔只做模拟，不在 OKX 下单"], tid))
             return
     # 先记“下单中”：万一下单途中进程被杀，重启后对账会按交易所实际持仓认领，不会留下没人管的仓位
     con.execute("update trades set live_status='opening' where id=?", (tid,)); con.commit()
@@ -378,18 +388,21 @@ def live_open(con, cfg, tid, inst, side, qty, stop):
                 note = f"下单返回异常（{e}），但交易所已有持仓，按持仓跟踪；" + okx_trade.ensure_stop(inst, side, stop, tid)
                 con.execute("update trades set live_status='open', live_sz=?, live_entry=?, live_note=? where id=?",
                             (pos["sz"], pos["avgPx"], note[:300], tid)); con.commit()
-                signal(con, inst, pos["avgPx"], "实盘", f"#{tid} {note}")
+                signal(con, inst, pos["avgPx"], "实盘", f"#{tid} {note}",
+                       notify.info_card("🛡️", f"{_mode()} · 按交易所持仓跟踪", inst, [note], tid))
                 return
         except Exception as e2:
             e = f"{e}；核对持仓也失败：{e2}"
         con.execute("update trades set live_status='failed', live_note=? where id=?", (str(e)[:300], tid)); con.commit()
         signal(con, inst, None, "错误", f"#{tid} OKX 开仓失败：{e}"[:300])
-        alert(cfg, f"[{inst}] #{tid} OKX 开仓失败：{e}")
+        alert(cfg, notify.info_card("⚠️", "OKX 开仓失败", inst, [str(e)[:300], "模拟交易照常进行"], tid), card=True)
         return
     con.execute("update trades set live_status='open', live_sz=?, live_entry=?, live_fee=?, live_note=? where id=?",
                 (r["sz"], r["avgPx"], r["fee"], r.get("note"), tid)); con.commit()
+    notional = r["sz"] * float(okx_trade.spec(inst)["ctVal"]) * r["avgPx"]
     signal(con, inst, r["avgPx"], "实盘", f"#{tid} {cfg['_live']}逐仓 {lev} 倍开{'多' if side > 0 else '空'} {r['sz']:g} 张（{size_note}）@{r['avgPx']:.6g}，"
-                                         f"止损单 {r['stop']:.6g}" + (f"；{r['note']}" if r.get("note") else ""))
+                                         f"止损单 {r['stop']:.6g}" + (f"；{r['note']}" if r.get("note") else ""),
+           notify.live_open_card(tid, cfg["_live"], inst, side, r["sz"], r["avgPx"], notional, lev, r["stop"], r.get("note")))
 
 
 def _side(t):
@@ -406,7 +419,7 @@ def live_close(con, cfg, tid, inst):
         live_error(con, inst, f"#{tid} OKX 平仓失败，下一轮重试（止损单仍在交易所上）：{e}")
         if time.time() - _LIVE_ALERT_TS.get(tid, 0) >= 1800:       # 同一笔平仓失败最多 30 分钟推送一次
             _LIVE_ALERT_TS[tid] = time.time()
-            alert(cfg, f"[{inst}] #{tid} OKX 平仓失败，程序每轮重试：{e}")
+            alert(cfg, notify.info_card("⚠️", "OKX 平仓失败", inst, [str(e)[:300], "程序每轮自动重试，止损单仍在交易所上兜底"], tid), card=True)
         return
     con.execute("update trades set live_status='closing', live_exit_ts=? where id=?", (now_ms(), tid)); con.commit()
     try:
@@ -429,8 +442,13 @@ def live_record(con, tid, inst):
     con.execute("""update trades set live_status='closed', live_exit=?, live_net=?, live_fee=?, live_funding=?, live_exit_ts=?,
                    live_note=trim(coalesce(live_note, '') || ' ' || ?) where id=?""",
                 (rec["closeAvgPx"], rec["net"], rec["fee"], rec["funding"], rec["uTime"], rec["type"], tid)); con.commit()
+    try:
+        eq = okx_trade.balance_usdt()["eq"]
+    except Exception:
+        eq = None
     signal(con, inst, rec["closeAvgPx"], "实盘", f"#{tid} OKX {rec['type']} {rec['openAvgPx']:.6g}→{rec['closeAvgPx']:.6g} "
-                                                 f"净{rec['net']:+.2f}U（手续费 {rec['fee']:.2f}U、资金费 {rec['funding']:+.2f}U）")
+                                                 f"净{rec['net']:+.2f}U（手续费 {rec['fee']:.2f}U、资金费 {rec['funding']:+.2f}U）",
+           notify.live_close_card(tid, _mode(), inst, _side(t), rec, eq))
 
 
 def live_reconcile(con, cfg, inst):
@@ -443,7 +461,8 @@ def live_reconcile(con, cfg, inst):
                 note = "下单途中程序中断，重启后按交易所持仓认领；" + okx_trade.ensure_stop(inst, _side(t), t["stop"], t["id"])
                 con.execute("update trades set live_status='open', live_sz=?, live_entry=?, live_note=? where id=?",
                             (pos["sz"], pos["avgPx"], note[:300], t["id"])); con.commit()
-                signal(con, inst, pos["avgPx"], "实盘", f"#{t['id']} {note}")
+                signal(con, inst, pos["avgPx"], "实盘", f"#{t['id']} {note}",
+                       notify.info_card("🛡️", f"{_mode()} · 重启后认领持仓", inst, [note], t["id"]))
                 t = con.execute("select * from trades where id=?", (t["id"],)).fetchone()
             else:
                 con.execute("update trades set live_status='failed', live_note='下单途中程序中断，交易所上没有持仓' where id=?", (t["id"],))
@@ -459,10 +478,12 @@ def live_reconcile(con, cfg, inst):
                     _STOP_CHECK_TS[t["id"]] = time.time()
                     note = okx_trade.ensure_stop(inst, _side(t), t["stop"], t["id"])
                     if note:
-                        signal(con, inst, None, "实盘", f"#{t['id']} {note}")
+                        signal(con, inst, None, "实盘", f"#{t['id']} {note}",
+                               notify.info_card("🛡️", f"{_mode()} · 补挂止损单", inst, [note, "（交易所上的止损单不见了，已按原止损价补挂）"], t["id"]))
                 continue
             con.execute("update trades set live_status='closing', live_exit_ts=? where id=?", (now_ms(), t["id"])); con.commit()
-            signal(con, inst, None, "实盘", f"#{t['id']} OKX 上的持仓已平（止损单成交或人工平仓），模拟交易继续按自己的规则跟踪")
+            signal(con, inst, None, "实盘", f"#{t['id']} OKX 上的持仓已平（止损单成交或人工平仓），模拟交易继续按自己的规则跟踪",
+                   notify.exchange_flat_card(t["id"], _mode(), inst, _side(t)))
             try:
                 okx_trade.cancel_stops(inst)
             except Exception:
@@ -499,7 +520,8 @@ def handle(con, cfg, inst, unit):
         for ts_, h, l in candles_1m_since(inst, last):          # 1) 止损：1 分钟 K 线逐根判定
             if (l <= t["stop"]) if long else (h >= t["stop"]):
                 net = close_trade(con, cfg, t, t["stop"], ts_ + 60_000, "止损")
-                signal(con, inst, price, "平仓", f"#{t['id']} 止损 {t['entry_px']:.6g}→{t['stop']:.6g} 净{net:+.2f}U")
+                signal(con, inst, price, "平仓", f"#{t['id']} 止损 {t['entry_px']:.6g}→{t['stop']:.6g} 净{net:+.2f}U",
+                       notify.close_card(t["id"], inst, 1 if long else -1, "止损", t["entry_px"], t["stop"], net, t["entry_ts"], ts_ + 60_000))
                 if cfg.get("_live_manage") and t["live_status"] == "open":
                     live_close(con, cfg, t["id"], inst)
                 return
@@ -510,7 +532,9 @@ def handle(con, cfg, inst, unit):
                      and ts_ > t["point_ts"]), None)
         if opp:
             net = close_trade(con, cfg, t, price, now_ms(), f"反向{opp[0]}")
-            signal(con, inst, price, "平仓", f"#{t['id']} 15m 出现{opp[0]}，按 {price:.6g} 离场 净{net:+.2f}U")
+            signal(con, inst, price, "平仓", f"#{t['id']} 15m 出现{opp[0]}，按 {price:.6g} 离场 净{net:+.2f}U",
+                   notify.close_card(t["id"], inst, 1 if long else -1, f"15m 出现{opp[0]}（反向离场）", t["entry_px"], price, net,
+                                     t["entry_ts"], now_ms()))
             if cfg.get("_live_manage") and t["live_status"] == "open":
                 live_close(con, cfg, t["id"], inst)
             return
@@ -585,7 +609,9 @@ def handle(con, cfg, inst, unit):
         wk = f"【低效率信号，TradeTrack 确认 1H {tt['1H']:+d} / 4H {tt['4H']:+d}】" if weak else ""
         signal(con, inst, price, "开仓", f"#{cur.lastrowid} {tp}{'做多' if side > 0 else '做空'}{wk} {mult:g} 倍（评分 {score:.2f}）@{price:.6g}"
                                         f"（买卖点 {px:.6g}），止损 {stop:.6g}，风险 {abs(price - stop) * qty:.2f}U；"
-                                        f"大方向 {trend:+.2f}，1H 缠论{ch1['trend']}，1H 趋势效率 {eff:.0%}，15m 中枢宽 {'-' if zs_w is None else f'{zs_w:.2f}'} ATR，4H ADX {adx4h:.0f}")
+                                        f"大方向 {trend:+.2f}，1H 缠论{ch1['trend']}，1H 趋势效率 {eff:.0%}，15m 中枢宽 {'-' if zs_w is None else f'{zs_w:.2f}'} ATR，4H ADX {adx4h:.0f}",
+               notify.open_card(cur.lastrowid, inst, side, tp, price, stop, abs(price - stop) * qty, trend, ch1["trend"], eff, zs_w,
+                                (price - px) * side / atr, (tt["1H"], tt["4H"]) if weak else None, ts_now))
         if cfg.get("_live"):
             live_open(con, cfg, cur.lastrowid, inst, side, qty, stop)
         return
@@ -598,7 +624,7 @@ def run_once():
     errors = []
     cfg["_live"], live_err = live_mode(cfg)
     cfg["_live_manage"] = live_manage_mode(cfg)
-    _CFG["_live"] = cfg["_live"]
+    _CFG["_live"], _CFG["_live_manage"] = cfg["_live"], cfg["_live_manage"]
     if live_err:
         errors.append(live_err)
         if live_err not in _LIVE_WARNED:          # 同一个配置问题只写一次日志
@@ -619,9 +645,9 @@ def run_once():
     hb = write_heartbeat(not errors, "；".join(errors))
     n = cfg.get("alert_after_errors", 3)
     if errors and hb["consecutive_errors"] == n:
-        alert(cfg, f"已连续 {n} 次运行失败：{hb['last_error']}")
+        alert(cfg, notify.info_card("⚠️", f"已连续 {n} 次运行失败", None, [hb["last_error"][:300], "程序会继续重试，恢复后会再通知"]), card=True)
     if not errors and prev.get("consecutive_errors", 0) >= n:
-        alert(cfg, f"已恢复正常（此前连续失败 {prev['consecutive_errors']} 次）")
+        alert(cfg, notify.info_card("✅", "已恢复正常", None, [f"此前连续失败 {prev['consecutive_errors']} 次"]), card=True)
     # 常驻模式下看板最多每 10 秒重写一次（有开平仓时立即重写）
     traded = con.execute("select count(*) from signals where ts>? and decision in ('开仓','平仓')", (now_ms() - 15_000,)).fetchone()[0]
     if not _MODE.get("loop") or traded or time.time() - _LAST_DASH[0] >= 10:
@@ -781,7 +807,7 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
 def test_alert():
     """python trader15.py test-alert：发一条测试告警，并打印每个渠道的结果。"""
     cfg = load_cfg(); _CFG.update(cfg)
-    r = alert(cfg, "测试消息：告警推送已接通")
+    r = alert(cfg, notify.info_card("🔔", "测试消息", None, ["告警推送已接通", f"来源：{_mode()}"]), card=True)
     print({True: "✅ 推送成功，请查看手机", False: "❌ 推送失败，原因见上面的日志", None: "没有配置任何推送渠道（alert_webhook 或 telegram_*）"}[r])
 
 
@@ -811,7 +837,8 @@ def test_trade():
                          values(?,?,?,?,?,?,?,?,?,?,?,?)""", (inst, "long", "测试", now_ms(), price, qty, 1.0, now_ms(), price, stop, now_ms(), "{}"))
     con.commit(); tid = cur.lastrowid
     print(f"1) 开仓 {inst} {qty:g} 个（最小数量）…")
-    signal(con, inst, price, "开仓", f"#{tid} 【推送测试】做多 @{price:.6g}，止损 {stop:.6g}（最小数量，约 {qty * price:.2f}U）")
+    signal(con, inst, price, "开仓", f"#{tid} 【推送测试】做多 @{price:.6g}，止损 {stop:.6g}（最小数量，约 {qty * price:.2f}U）",
+           notify.open_card(tid, inst, 1, "推送测试（最小数量）", price, stop, abs(price - stop) * qty, 0.0, "-", 0.0, None, 0.0, None, now_ms()))
     live_open(con, cfg, tid, inst, 1, qty, stop)
     t = con.execute("select * from trades where id=?", (tid,)).fetchone()
     print(f"   OKX 状态：{t['live_status']}，{t['live_sz']} 张 @{t['live_entry']}｜{t['live_note'] or ''}")
@@ -819,8 +846,9 @@ def test_trade():
         con.close(); DB.unlink(missing_ok=True); return
     print("2) 10 秒后平仓…"); time.sleep(10)
     px = float(ox.ticker(inst)["last"])
-    close_trade(con, cfg, t, px, now_ms(), "测试")
-    signal(con, inst, px, "平仓", f"#{tid} 【推送测试】按 {px:.6g} 平仓")
+    net = close_trade(con, cfg, t, px, now_ms(), "测试")
+    signal(con, inst, px, "平仓", f"#{tid} 【推送测试】按 {px:.6g} 平仓",
+           notify.close_card(tid, inst, 1, "推送测试", t["entry_px"], px, net, t["entry_ts"], now_ms()))
     live_close(con, cfg, tid, inst)
     for _ in range(10):
         t = con.execute("select * from trades where id=?", (tid,)).fetchone()

@@ -226,12 +226,25 @@ def main():
     clock = types.SimpleNamespace(time=lambda: NOW[0] / 1000, sleep=lambda s: None)
     tr.time = clock; lt.time = clock
     tr.now_ms = lambda: NOW[0]
-    tr.alert = lambda cfg, text: None
+    from html.parser import HTMLParser
+    class _V(HTMLParser):
+        def __init__(self):
+            super().__init__(); self.st = []
+        def handle_starttag(self, tag, a):
+            self.st.append(tag)
+        def handle_endtag(self, tag):
+            assert self.st and self.st.pop() == tag, f"推送卡片 HTML 标签不配对：{tag}"
+    PUSHES = []
+    def fake_alert(cfg, text, card=False):         # 不真的发送，但检查每条推送卡片的 HTML 能被 Telegram 解析
+        v = _V(); v.feed(text); assert not v.st, f"推送卡片 HTML 标签没闭合：{v.st}"
+        PUSHES.append(text)
+    tr.alert = fake_alert
+    tr._CFG["alert_trades"] = True
     tr.write_dashboard = lambda con, cfg: None
 
     tmp = Path(tempfile.mkdtemp(prefix="t15replay_"))
     tr.DB, tr.HEARTBEAT, tr.CFG_PATH, tr.ROOT = tmp / "trader15.db", tmp / "heartbeat.json", tmp / "trader15_config.json", tmp
-    tr.CFG_PATH.write_text(json.dumps({**cfg0, "live_trading": True}, ensure_ascii=False), encoding="utf-8")
+    tr.CFG_PATH.write_text(json.dumps({**cfg0, "live_trading": True, "alert_trades": True}, ensure_ascii=False), encoding="utf-8")
 
     end = min(int(mkt.k[(i, "1m")][0][-1]) for i in insts) // M15 * M15
     start = end - days * 86_400_000
@@ -272,6 +285,7 @@ def main():
     print(f"OKX 已平 {len(closed)} 笔，实际净利合计 {closed.live_net.sum():+,.0f}U；期末权益 {ex.equity():,.0f}U（期初 100,000U），"
           f"期末交易所持仓 {len(ex.pos)}，数据库 open {int((df.live_status == 'open').sum())}")
     print(f"不变量违反：{len(bad)} 次" + ("".join("\n  " + b for b in bad[:15])))
+    print(f"推送 {len(PUSHES)} 条（HTML 格式全部通过检查），示例：\n" + "\n---\n".join(__import__("notify").plain(x) for x in PUSHES[:3]))
     print(f"错误记录 {len(errs)} 条" + "".join(f"\n  {r.inst} {r.detail[:110]}" for r in errs.head(8).itertuples()))
     df[["id", "inst", "side", "point", "entry_ts", "entry_px", "stop", "exit_reason", "live_status", "live_entry", "live_exit", "live_net"]].to_csv(tmp / "trades.csv", index=False)
     print("逐笔明细：", tmp / "trades.csv")
