@@ -1,11 +1,13 @@
 """
-15 分钟级缠论单仓模拟交易（只模拟，不下真实订单）。
+15 分钟级缠论单仓交易（默认只模拟；live_trading=true 时同步下单到 OKX）。
 
-规则 v2（chan15_lab2.py 控制变量测试：8 个品种、窄中枢、只做多）：
+规则 v3（chan15_lab2.py 控制变量测试：8 个品种、窄中枢、多空都做）：
   品种：ETH / BTC / SOL / XRP / DOGE / SUI / ZEC / HYPE，每个品种各自一个仓位，1 倍 ≈ 2500U 名义价值
-  入场：15m 新确认的三买做多，按当前价成交（不计滑点），不加仓；不做空（90 天回测空单两段都亏）
+  入场：15m 新确认的三买做多、三卖做空，按当前价成交（不计滑点），不加仓
+        （180 天回测：空单在涨势里小亏、跌势里大赚，6 月 BTC −21% 时多空 +28.9%、只做多 +5.3%；
+          6 个月复利多空 +174.6% / 回撤 19.8%，只做多 +147.8% / 回撤 16.5%）
   仓位：固定 1 倍（与回测一致）；sizing=step 可改回按评分分档 0.5 / 1 / 2 / 3 / 5 倍（sizing.py）
-  过滤：① 大方向：1H*0.6 + 4H*0.4 趋势分不能明显相反（多单要求 > -1）
+  过滤：① 大方向：1H*0.6 + 4H*0.4 趋势分不能明显相反（多单要求 > -1，空单要求 < +1）
         ② 区间套：1H 缠论方向（走势 + 近期买卖点）不能相反
         ③ 行情性质：只做趋势——1H 近 48 根 K 线趋势效率（净涨跌 / 逐根涨跌绝对值之和）≥ 20%
         ④ 窄中枢：15m 最近中枢宽度（ZG − ZD）≤ 1.5 倍 ATR(15m)，宽幅震荡后的突破不做
@@ -41,7 +43,7 @@ import ta  # noqa: E402
 
 TZ = timezone(timedelta(hours=8))
 CFG_PATH = ROOT / "trader15_config.json"
-STRATEGY_VERSION = 2
+STRATEGY_VERSION = 3
 DEFAULT_CFG = {
     "strategy_version": STRATEGY_VERSION,
     # 1 倍 ≈ 2500U 名义价值（按 2026-09 价格折算）
@@ -50,7 +52,7 @@ DEFAULT_CFG = {
                     "ZEC-USDT-SWAP": {"unit": 1.8}, "HYPE-USDT-SWAP": {"unit": 28}},
     "fee_mode": "okx",          # okx：成交金额 × OKX 吃单费率 + 实际资金费（见 fees.py）；fixed：每 1 倍固定 fee_per_unit
     "fee_per_unit": 2.0,
-    "entry_points": ["三买"],   # 只做多；加上 "三卖" 就恢复多空都做
+    "entry_points": ["三买", "三卖"],   # 多空都做；只写 "三买" 就只做多
     "trend_filter": True,
     "trend_threshold": 1.0,
     "nest_filter": True,
@@ -66,7 +68,7 @@ DEFAULT_CFG = {
     "telegram_chat_id": "",
     "alert_after_errors": 3,    # 连续失败几次运行才告警
     "alert_trades": False,      # 开仓 / 平仓时是否也推送
-    # OKX 下单（见 okx_trade.py）：模拟交易照常运行并做决策，开启后每笔开平仓同步到 OKX；一律逐仓、只做多
+    # OKX 下单（见 okx_trade.py）：模拟交易照常运行并做决策，开启后每笔开平仓同步到 OKX；一律逐仓，多空都做
     "live_trading": False,      # true：同步下单到 OKX（需 okx_api.json 里的交易权限 Key）
     "live_leverage": 10,        # 逐仓杠杆（10 倍：强平约在开仓价下方 9.5%，回测里所有止损都在强平之前）
     "live_sizing": "equity",    # equity：每笔名义价值 = 开仓时 OKX 账户 USDT 权益 × live_equity_frac；fixed：模拟仓位数量 × live_size_factor
@@ -97,19 +99,44 @@ STRATEGY_KEYS = ("instruments", "entry_points", "min_trend_eff_1h", "max_zs_widt
 
 
 def migrate_cfg(raw):
-    """旧版配置升级到当前策略：备份旧配置，覆盖策略项；旧成交记录归档到 trader15_v{旧版本}.db，新策略从零开始统计。"""
+    """旧版配置升级到当前策略，先备份旧配置。
+    v1 → 当前：覆盖全部策略项，旧成交记录归档到 trader15_v1.db，新策略从零开始统计（v1 与 v2 规则差别很大）。
+    v2 → v3：只把入场点改为多空都做；不归档成交记录（v2 可能已有 OKX 持仓在跟踪，归档会让它们没人管）。"""
     user = json.loads(raw)
     old = user.get("strategy_version", 1)
     if old >= STRATEGY_VERSION:
         return user
     CFG_PATH.with_name(f"trader15_config.v{old}.json").write_text(raw, encoding="utf-8")
+    note = f"旧配置备份为 trader15_config.v{old}.json"
     if DB.exists():            # 先归档再写新配置：归档失败（如 Windows 上文件被占用）时下次启动会重试
-        DB.rename(ROOT / f"trader15_v{old}.db")
-    user.update({k: DEFAULT_CFG[k] for k in STRATEGY_KEYS}, strategy_version=STRATEGY_VERSION)
+        arch = ROOT / f"trader15_v{old}.db"
+        DB.rename(arch)
+        n = carry_open_trades(arch)
+        note += f"，已平仓记录归档为 {arch.name}" + (f"，{n} 笔未平仓位带到新库继续跟踪" if n else "")
+    if old < 2:
+        user.update({k: DEFAULT_CFG[k] for k in STRATEGY_KEYS})
+    else:
+        user["entry_points"] = DEFAULT_CFG["entry_points"]        # v2 → v3：只改为多空都做
+    user["strategy_version"] = STRATEGY_VERSION
     CFG_PATH.write_text(json.dumps(user, ensure_ascii=False, indent=2), encoding="utf-8")
-    log.info(f"策略升级 v{old} → v{STRATEGY_VERSION}：旧配置备份为 trader15_config.v{old}.json，"
-             f"旧成交记录归档为 trader15_v{old}.db")
+    log.info(f"策略升级 v{old} → v{STRATEGY_VERSION}：{note}")
     return user
+
+
+def carry_open_trades(arch):
+    """归档旧库时，把还没平的仓位（模拟未平，或 OKX 上还在持仓 / 待补记）连同已用过的买卖点带到新库，
+    保留原编号，由新策略接着按原规则止损 / 离场、继续和 OKX 对账；否则交易所上的仓位会没人管。返回带过去的笔数。"""
+    old = db(arch)
+    rows = old.execute("select * from trades where exit_ts is null or live_status in ('open', 'closing')").fetchall()
+    pts = old.execute("select * from used_points").fetchall()
+    old.close()
+    con = db()
+    for r in rows:
+        ks = list(r.keys())
+        con.execute(f"insert into trades({','.join(ks)}) values({','.join('?' * len(ks))})", tuple(r))
+    con.executemany("insert or ignore into used_points values(?,?,?)", [tuple(p) for p in pts])
+    con.commit(); con.close()
+    return len(rows)
 
 
 def load_cfg():
@@ -124,8 +151,8 @@ def load_cfg():
     return {**DEFAULT_CFG, **user}
 
 
-def db():
-    con = sqlite3.connect(DB)
+def db(path=None):
+    con = sqlite3.connect(path or DB)
     con.row_factory = sqlite3.Row
     con.executescript("""
     create table if not exists trades(
@@ -291,18 +318,18 @@ def live_qty(cfg, inst, qty):
     return notional / px, f"按权益 {b['eq']:,.0f}U × {frac:g} ≈ {notional:,.0f}U"
 
 
-def live_open(con, cfg, tid, inst, qty, stop):
+def live_open(con, cfg, tid, inst, side, qty, stop):
     import okx_trade
     lev = cfg.get("live_leverage", 10)
     try:
         q, size_note = live_qty(cfg, inst, qty)
-        r = okx_trade.open_long(inst, q, stop, lev, tid)
+        r = okx_trade.open_position(inst, side, q, stop, lev, tid)
     except Exception as e:
         # 下单请求本身出错时，订单可能其实已成交：以交易所持仓为准，有持仓就接着跟踪并确认止损单
         try:
-            pos = okx_trade.position(inst)
+            pos = okx_trade.position(inst, side)
             if pos:
-                note = f"下单返回异常（{e}），但交易所已有持仓，按持仓跟踪；" + okx_trade.ensure_stop(inst, stop, tid)
+                note = f"下单返回异常（{e}），但交易所已有持仓，按持仓跟踪；" + okx_trade.ensure_stop(inst, side, stop, tid)
                 con.execute("update trades set live_status='open', live_sz=?, live_entry=?, live_note=? where id=?",
                             (pos["sz"], pos["avgPx"], note[:300], tid)); con.commit()
                 signal(con, inst, pos["avgPx"], "实盘", f"#{tid} {note}")
@@ -315,15 +342,20 @@ def live_open(con, cfg, tid, inst, qty, stop):
         return
     con.execute("update trades set live_status='open', live_sz=?, live_entry=?, live_fee=?, live_note=? where id=?",
                 (r["sz"], r["avgPx"], r["fee"], r.get("note"), tid)); con.commit()
-    signal(con, inst, r["avgPx"], "实盘", f"#{tid} {cfg['_live']}逐仓 {lev} 倍开多 {r['sz']:g} 张（{size_note}）@{r['avgPx']:.6g}，"
+    signal(con, inst, r["avgPx"], "实盘", f"#{tid} {cfg['_live']}逐仓 {lev} 倍开{'多' if side > 0 else '空'} {r['sz']:g} 张（{size_note}）@{r['avgPx']:.6g}，"
                                          f"止损单 {r['stop']:.6g}" + (f"；{r['note']}" if r.get("note") else ""))
+
+
+def _side(t):
+    return 1 if t["side"] == "long" else -1
 
 
 def live_close(con, cfg, tid, inst):
     """模拟交易平仓后，把 OKX 上对应的仓位也平掉（交易所已经止损的话只撤剩余止损单）。"""
     import okx_trade
+    t = con.execute("select side from trades where id=?", (tid,)).fetchone()
     try:
-        okx_trade.close_long(inst, tid)
+        okx_trade.close_position(inst, _side(t), tid)
     except Exception as e:
         signal(con, inst, None, "错误", f"#{tid} OKX 平仓失败，下一轮重试（止损单仍在交易所上）：{e}"[:300])
         alert(cfg, f"[{inst}] #{tid} OKX 平仓失败：{e}")
@@ -339,7 +371,7 @@ def live_record(con, tid, inst):
     """从 OKX 仓位历史补记真实平仓结果；平仓后几秒内可能还查不到，下一轮再查。"""
     import okx_trade
     t = con.execute("select * from trades where id=?", (tid,)).fetchone()
-    rec = okx_trade.closed_record(inst, t["entry_ts"])
+    rec = okx_trade.closed_record(inst, t["entry_ts"], _side(t))
     if not rec:
         if now_ms() - (t["live_exit_ts"] or now_ms()) > 30 * 60_000:     # 30 分钟仍查不到：结束对账，留待人工核对
             con.execute("update trades set live_status='closed', live_note=trim(coalesce(live_note, '') || ' OKX 未查到平仓记录，请人工核对') "
@@ -361,7 +393,7 @@ def live_reconcile(con, cfg, inst):
             if t["exit_ts"] is not None:
                 live_close(con, cfg, t["id"], inst)
                 continue
-            if okx_trade.position(inst):
+            if okx_trade.position(inst, _side(t)):
                 continue
             con.execute("update trades set live_status='closing', live_exit_ts=? where id=?", (now_ms(), t["id"])); con.commit()
             signal(con, inst, None, "实盘", f"#{t['id']} OKX 上的持仓已平（止损单成交或人工平仓），模拟交易继续按自己的规则跟踪")
@@ -470,8 +502,8 @@ def handle(con, cfg, inst, unit):
         signal(con, inst, price, "开仓", f"#{cur.lastrowid} {tp}{'做多' if side > 0 else '做空'} {mult:g} 倍（评分 {score:.2f}）@{price:.6g}"
                                         f"（买卖点 {px:.6g}），止损 {stop:.6g}，风险 {abs(price - stop) * qty:.2f}U；"
                                         f"大方向 {trend:+.2f}，1H 缠论{ch1['trend']}，1H 趋势效率 {eff:.0%}，15m 中枢宽 {'-' if zs_w is None else f'{zs_w:.2f}'} ATR，4H ADX {adx4h:.0f}")
-        if cfg.get("_live") and side > 0:
-            live_open(con, cfg, cur.lastrowid, inst, qty, stop)
+        if cfg.get("_live"):
+            live_open(con, cfg, cur.lastrowid, inst, side, qty, stop)
         return
     signal(con, inst, price, "放弃", "；".join(notes))
 

@@ -2,8 +2,9 @@
 OKX 下单前自检（在绑定了 IP 白名单的服务器上运行）。
 
   python okx_live_check.py             只读检查：Key 能否登录、账户模式、USDT 余额、每个品种的下单张数，并设置逐仓杠杆
-  python okx_live_check.py roundtrip   另外在【模拟盘】上用最小数量完整走一遍：开多 + 附带止损 → 核对止损单 → 平仓 → 撤单 → 读仓位历史
-                                       （只允许模拟盘；Key 不是模拟盘会直接拒绝）
+  python okx_live_check.py roundtrip [合约] [long|short]
+                                       另外在【模拟盘】上用最小数量完整走一遍：开仓 + 附带止损 → 核对止损单 → 平仓 → 撤单 → 读仓位历史
+                                       （默认 DOGE-USDT-SWAP 多单；只允许模拟盘，Key 不是模拟盘会直接拒绝）
 """
 import sys
 import time
@@ -48,28 +49,30 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "roundtrip":
         if not c["simulated"]:
             print("\nroundtrip 只允许在模拟盘上运行（okx_api.json 里 simulated 需为 true），已拒绝"); return 1
-        roundtrip(sys.argv[2] if len(sys.argv) > 2 else "DOGE-USDT-SWAP", lev)
+        roundtrip(sys.argv[2] if len(sys.argv) > 2 else "DOGE-USDT-SWAP", lev,
+                  -1 if len(sys.argv) > 3 and sys.argv[3] == "short" else 1)
     return 0
 
 
-def roundtrip(inst, lev):
-    print(f"\n== 模拟盘完整流程测试：{inst} ==")
+def roundtrip(inst, lev, side=1):
+    d = "多" if side > 0 else "空"
+    print(f"\n== 模拟盘完整流程测试：{inst} {d}单 ==")
     if lt.position(inst):
-        print("该合约已有逐仓多单，为免干扰，不做测试"); return
+        print("该合约已有逐仓仓位，为免干扰，不做测试"); return
     s = lt.spec(inst)
     px = float(trader15.ox.ticker(inst)["last"])
     qty = float(s["minSz"] * s["ctVal"])
     t0 = int(time.time() * 1000)
-    r = lt.open_long(inst, qty, px * 0.97, lev, 0)
-    print(f"1. 开多 {r['sz']:g} 张 @{r['avgPx']}，手续费 {r['fee']:.4f}U，止损 {r['stop']}{'；' + r['note'] if r.get('note') else ''}")
-    p = lt.position(inst)
+    r = lt.open_position(inst, side, qty, px * (1 - 0.03 * side), lev, 0)
+    print(f"1. 开{d} {r['sz']:g} 张 @{r['avgPx']}，手续费 {r['fee']:.4f}U，止损 {r['stop']}{'；' + r['note'] if r.get('note') else ''}")
+    p = lt.position(inst, side)
     print(f"2. 交易所持仓：{p}")
     st = lt.pending_stops(inst)
     print(f"3. 挂着的止损单：{[(x.get('ordType'), x.get('slTriggerPx'), x.get('sz'), x.get('state')) for x in st]}")
     time.sleep(2)
-    print(f"4. 平仓：{'已下平仓单' if lt.close_long(inst, 0) else '已无持仓'}；剩余止损单 {len(lt.pending_stops(inst))} 张；持仓 {lt.position(inst)}")
+    print(f"4. 平仓：{'已下平仓单' if lt.close_position(inst, side, 0) else '已无持仓'}；剩余止损单 {len(lt.pending_stops(inst))} 张；持仓 {lt.position(inst)}")
     for i in range(10):
-        rec = lt.closed_record(inst, t0)
+        rec = lt.closed_record(inst, t0, side)
         if rec:
             print(f"5. 仓位历史：{rec}"); break
         time.sleep(1)

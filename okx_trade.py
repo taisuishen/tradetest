@@ -1,8 +1,8 @@
 """
-OKX 下单接口（私有 REST）：逐仓、只做多，开仓时把止损单一起挂到交易所上。
+OKX 下单接口（私有 REST）：逐仓、多空都做，开仓时把止损单一起挂到交易所上。
 
   - 一律逐仓：下单 tdMode=isolated，设杠杆 / 平仓 mgnMode=isolated
-  - 开仓：市价买入，同时附带止损单（attachAlgoOrds：最新价触发，市价成交），程序断线也会止损
+  - 开仓：市价买入（多）/ 卖出（空），同时附带止损单（attachAlgoOrds：最新价触发，市价成交），程序断线也会止损
   - 平仓：close-position 市价全平，并撤掉该合约剩下的止损单
   - 对账：positions 查当前持仓，positions-history 取已平仓位的真实开平均价、手续费、资金费、净盈亏
 
@@ -16,7 +16,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -109,9 +109,10 @@ def check_account():
     return a
 
 
-def _pos_side():
-    """双向持仓模式要带 posSide=long；单向（净持仓）模式不带。"""
-    return {"posSide": "long"} if account()["posMode"] == "long_short_mode" else {}
+def _pos_side(side):
+    """双向持仓模式要带 posSide=long / short；单向（净持仓）模式不带。side：1 多、-1 空。"""
+    return {"posSide": "long" if side > 0 else "short"} if account()["posMode"] == "long_short_mode" else {}
+
 
 
 def spec(inst):
@@ -136,19 +137,20 @@ def contracts(inst, qty):
     return n if n >= s["minSz"] else Decimal(0)
 
 
-def price_str(inst, px):
-    """价格按 tickSz 向下取整（多单止损略低一点，不会比策略止损更早触发）。"""
+def price_str(inst, px, side=1):
+    """止损价按 tickSz 取整，往“更晚触发”的方向取：多单止损向下、空单止损向上，不会比策略止损更早触发。"""
     t = spec(inst)["tickSz"]
-    return num((Decimal(str(px)) / t).to_integral_value(ROUND_DOWN) * t)
+    return num((Decimal(str(px)) / t).to_integral_value(ROUND_DOWN if side > 0 else ROUND_UP) * t)
 
 
-def ensure_leverage(inst, lever):
-    """逐仓杠杆，每个进程每个合约只设一次。"""
+def ensure_leverage(inst, lever, side=1):
+    """逐仓杠杆，每个进程每个合约（双向持仓模式下每个方向）只设一次。"""
     done = _STATE.setdefault("lever", {})
-    if done.get(inst) == lever:
+    key = (inst, _pos_side(side).get("posSide"))
+    if done.get(key) == lever:
         return
-    post("/api/v5/account/set-leverage", {"instId": inst, "lever": str(lever), "mgnMode": "isolated", **_pos_side()}, idempotent=True)
-    done[inst] = lever
+    post("/api/v5/account/set-leverage", {"instId": inst, "lever": str(lever), "mgnMode": "isolated", **_pos_side(side)}, idempotent=True)
+    done[key] = lever
 
 
 def balance_usdt():
@@ -158,14 +160,16 @@ def balance_usdt():
 
 
 # ---------------- 持仓与挂单 ----------------
-def position(inst):
-    """当前逐仓多单：{"sz": 张数, "avgPx", "liqPx", "lever"}；没有返回 None。"""
+def position(inst, side=None):
+    """当前逐仓仓位：{"side": 1/-1, "sz": 张数, "avgPx", "liqPx", "lever", "upl"}；side 不为 None 时只找该方向。没有返回 None。"""
     for p in get("/api/v5/account/positions", instType="SWAP", instId=inst):
         if p.get("mgnMode") != "isolated" or not p.get("pos") or float(p["pos"]) == 0:
             continue
-        if p.get("posSide") == "short" or (p.get("posSide") == "net" and float(p["pos"]) < 0):
+        ps = p.get("posSide")
+        d = (1 if ps == "long" else -1) if ps in ("long", "short") else (1 if float(p["pos"]) > 0 else -1)   # 单向模式按正负
+        if side is not None and d != side:
             continue
-        return {"sz": abs(float(p["pos"])), "avgPx": float(p.get("avgPx") or 0), "liqPx": float(p.get("liqPx") or 0),
+        return {"side": d, "sz": abs(float(p["pos"])), "avgPx": float(p.get("avgPx") or 0), "liqPx": float(p.get("liqPx") or 0),
                 "lever": p.get("lever"), "upl": float(p.get("upl") or 0)}
     return None
 
@@ -199,12 +203,12 @@ def _cl_id(prefix, tid):
 
 
 # ---------------- 开平仓 ----------------
-def open_long(inst, qty, stop_px, lever, tid):
-    """市价开多 + 附带止损。返回 {"sz", "avgPx", "fee", "ordId", "stop"}。
+def open_position(inst, side, qty, stop_px, lever, tid):
+    """市价开仓（side：1 开多 / -1 开空）+ 附带止损。返回 {"sz", "avgPx", "fee", "ordId", "stop"}。
     成交后核对交易所上确实挂着止损单；没有就补挂一张，补挂也失败就立即平仓（绝不留没有止损的仓位）。"""
     check_account()
     if position(inst):
-        raise OkxError(f"{inst} 交易所上已有逐仓多单，不重复开仓（请先人工确认）")
+        raise OkxError(f"{inst} 交易所上已有逐仓仓位，不重复开仓（请先人工确认）")
     sz = contracts(inst, qty)
     if not sz:
         s = spec(inst)
@@ -212,11 +216,11 @@ def open_long(inst, qty, stop_px, lever, tid):
     capped = sz > spec(inst)["maxMktSz"]
     if capped:
         sz = spec(inst)["maxMktSz"]
-    ensure_leverage(inst, lever)
-    stop = price_str(inst, stop_px)
+    ensure_leverage(inst, lever, side)
+    stop = price_str(inst, stop_px, side)
     cl = _cl_id("t15o", tid)
-    body = {"instId": inst, "tdMode": "isolated", "side": "buy", "ordType": "market", "sz": num(sz), "clOrdId": cl,
-            **_pos_side(),
+    body = {"instId": inst, "tdMode": "isolated", "side": "buy" if side > 0 else "sell", "ordType": "market", "sz": num(sz),
+            "clOrdId": cl, **_pos_side(side),
             "attachAlgoOrds": [{"attachAlgoClOrdId": cl + "s", "slTriggerPx": stop, "slOrdPx": "-1", "slTriggerPxType": "last"}]}
     r = post("/api/v5/trade/order", body)[0]
     o = _order(inst, r["ordId"])
@@ -224,42 +228,46 @@ def open_long(inst, qty, stop_px, lever, tid):
         raise OkxError(f"{inst} 市价单未成交（状态 {o.get('state')}）")
     res = {"sz": float(o["accFillSz"]), "avgPx": float(o["avgPx"]), "fee": -float(o.get("fee") or 0), "ordId": r["ordId"], "stop": float(stop)}
     time.sleep(0.5)
-    note = ensure_stop(inst, stop_px, tid)
+    note = ensure_stop(inst, side, stop_px, tid)
     if capped:
         note = (note + f"；数量超过单笔市价单上限，按上限 {num(sz)} 张下单").lstrip("；")
-    pos = position(inst)
-    if pos and pos["liqPx"] and pos["liqPx"] >= float(stop):
-        note = (note + f"；警告：强平价 {pos['liqPx']} 不低于止损价 {stop}").lstrip("；")
+    pos = position(inst, side)
+    if pos and pos["liqPx"] and (pos["liqPx"] - float(stop)) * side >= 0:
+        note = (note + f"；警告：强平价 {pos['liqPx']} 在止损价 {stop} 之前").lstrip("；")
     if note:
         res["note"] = note
     return res
 
 
-def ensure_stop(inst, stop_px, tid=0):
+def open_long(inst, qty, stop_px, lever, tid):
+    return open_position(inst, 1, qty, stop_px, lever, tid)
+
+
+def ensure_stop(inst, side, stop_px, tid=0):
     """确认交易所上挂着止损单；没有就按当前持仓补挂一张（只减仓、最新价触发、市价成交），补挂失败就立即平仓。
     返回说明文字（已有止损时为空）。"""
     if pending_stops(inst):
         return ""
-    pos = position(inst)
+    pos = position(inst, side)
     if not pos:
         return ""
-    stop = price_str(inst, stop_px)
+    stop = price_str(inst, stop_px, side)
     try:
-        post("/api/v5/trade/order-algo", {"instId": inst, "tdMode": "isolated", "side": "sell", "ordType": "conditional",
-                                          "sz": num(str(pos["sz"])), "reduceOnly": "true", **_pos_side(),
+        post("/api/v5/trade/order-algo", {"instId": inst, "tdMode": "isolated", "side": "sell" if side > 0 else "buy",
+                                          "ordType": "conditional", "sz": num(str(pos["sz"])), "reduceOnly": "true", **_pos_side(side),
                                           "slTriggerPx": stop, "slOrdPx": "-1", "slTriggerPxType": "last"})
         return f"止损单未生效，已补挂止损 {stop}"
     except Exception as e:
-        close_long(inst, tid)
+        close_position(inst, side, tid)
         raise OkxError(f"{inst} 挂止损失败，已立即平仓（不留没有止损的仓位）：{e}")
 
 
-def close_long(inst, tid=0):
-    """市价全平逐仓多单并撤掉剩余止损单；已经没有仓位时只撤单。返回是否真的下了平仓单。"""
+def close_position(inst, side, tid=0):
+    """市价全平该方向的逐仓仓位并撤掉剩余止损单；已经没有仓位时只撤单。返回是否真的下了平仓单。"""
     closed = False
-    if position(inst):
+    if position(inst, side):
         post("/api/v5/trade/close-position", {"instId": inst, "mgnMode": "isolated", "autoCxl": True,
-                                              "clOrdId": _cl_id("t15c", tid), "posSide": _pos_side().get("posSide", "net")})
+                                              "clOrdId": _cl_id("t15c", tid), "posSide": _pos_side(side).get("posSide", "net")})
         closed = True
         time.sleep(0.5)
     try:
@@ -269,13 +277,18 @@ def close_long(inst, tid=0):
     return closed
 
 
-def closed_record(inst, since_ms):
-    """since_ms 之后开、并已平掉的逐仓多单：真实开平均价、手续费、资金费、净盈亏（realizedPnl 已含手续费和资金费）。
+def close_long(inst, tid=0):
+    return close_position(inst, 1, tid)
+
+
+def closed_record(inst, since_ms, side=1):
+    """since_ms 之后开、并已平掉的该方向逐仓仓位：真实开平均价、手续费、资金费、净盈亏（realizedPnl 已含手续费和资金费）。
     同一合约的仓位是一笔接一笔的，所以取 since_ms 之后最早开的那一条（接口按时间倒序返回，后面几笔也满足“之后”）。
     type：1 部分平仓 2 完全平仓 3 强平 4 部分强平 5 自动减仓（ADL）。平仓后几秒内可能还查不到，查不到返回 None。"""
     # 留 5 秒本机与交易所的时钟误差；单向持仓模式下 posId 会复用，不能用来区分
+    want = "long" if side > 0 else "short"
     hs = [h for h in get("/api/v5/account/positions-history", instType="SWAP", instId=inst, mgnMode="isolated", limit="20")
-          if int(h.get("cTime") or 0) >= since_ms - 5000 and int(h.get("uTime") or 0) >= since_ms and h.get("direction") != "short"]
+          if int(h.get("cTime") or 0) >= since_ms - 5000 and int(h.get("uTime") or 0) >= since_ms and h.get("direction") == want]
     if not hs:
         return None
     h = min(hs, key=lambda x: int(x["cTime"]))
