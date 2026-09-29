@@ -329,12 +329,20 @@ def stats(df, days):
 
 
 def load(days=90, insts=None, name="", end_ms=None):
-    OUT.mkdir(exist_ok=True)
-    f = OUT / f"lab2_{days}{name}{'_' + time.strftime('%Y%m%d', time.gmtime(end_ms / 1000)) if end_ms else ''}.pkl"
-    if not f.exists():
-        pickle.dump(precompute(days, insts or (("ETH-USDT-SWAP", 1.0), ("BTC-USDT-SWAP", 0.03)), end_ms), open(f, "wb"))
-    data = pickle.load(open(f, "rb"))
+    """预计算结果按品种分别缓存在 bt/（算完一个存一个，中途停掉不会丢）；兼容旧的整包缓存。"""
     import fees
+    OUT.mkdir(exist_ok=True)
+    insts = insts or (("ETH-USDT-SWAP", 1.0), ("BTC-USDT-SWAP", 0.03))
+    tag = f"lab2_{days}{name}{'_' + time.strftime('%Y%m%d', time.gmtime(end_ms / 1000)) if end_ms else ''}"
+    whole = OUT / f"{tag}.pkl"
+    data = pickle.load(open(whole, "rb")) if whole.exists() else {}
+    for inst, unit in insts:
+        if inst in data:
+            continue
+        f = OUT / f"{tag}_{inst}.pkl"
+        if not f.exists():
+            pickle.dump(precompute(days, ((inst, unit),), end_ms), open(f, "wb"))
+        data.update(pickle.load(open(f, "rb")))          # 数据不足而跳过的品种是空字典
     for v in data.values():                  # 旧缓存可能存的是账户费率：统一改回 Lv1 标准费率
         v[5]["taker"], v[5]["maker"] = fees.DEFAULT["taker"], fees.DEFAULT["maker"]
     return data

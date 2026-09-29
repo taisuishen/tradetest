@@ -3,6 +3,7 @@
 
 用法：python bt_monthly.py [天数=180]                    最近 N 天
       python bt_monthly.py 2025-01-01 2026-01-01          指定区间（北京时间，含起不含止）
+      python bt_monthly.py 2025-01-01 2026-01-01 --skip ZEC,HYPE    跳过某些品种
       首次运行会拉 K 线并预计算（缓存在 bt/）；费用按 OKX Lv1 标准吃单 0.05%，不计滑点
 """
 import os, sys
@@ -11,17 +12,24 @@ import pandas as pd
 import chan15_lab2 as L
 
 TZ = "Asia/Shanghai"
-if len(sys.argv) > 2:                       # 指定区间：按结束时间往前推天数
-    _s, _e = (pd.Timestamp(x, tz=TZ) for x in sys.argv[1:3])
+# 不改 sys.argv：多进程子进程会用同一份 argv 重新解析
+_argv = sys.argv[1:]
+SKIP = set()
+if "--skip" in _argv:
+    k = _argv.index("--skip")
+    SKIP = {x.strip().upper() for x in _argv[k + 1].split(",")}
+    _argv = _argv[:k] + _argv[k + 2:]
+if len(_argv) > 1:                          # 指定区间：按结束时间往前推天数
+    _s, _e = (pd.Timestamp(x, tz=TZ) for x in _argv[:2])
     DAYS, END_MS = (_e - _s).days, int(_e.timestamp() * 1000)
 else:
-    DAYS, END_MS = (int(sys.argv[1]) if len(sys.argv) > 1 else 180), None
+    DAYS, END_MS = (int(_argv[0]) if _argv else 180), None
 VARIANTS = {"多空都做（实盘）": {"三买", "三卖"}, "只做多": {"三买"}, "只做空": {"三卖"}}
 _D = {}
 
 
 def _init():
-    insts = L.live_insts()
+    insts = tuple((i, u) for i, u in L.live_insts() if i.split("-")[0] not in SKIP)
     _D.update({i: d for i, d in L.load(DAYS, insts, "_live", END_MS).items() if i in dict(insts)})
 
 
@@ -72,7 +80,7 @@ if __name__ == "__main__":
         table[name] = col
         peak = cv["eq"].cummax(); mdd = float((1 - cv["eq"] / peak).max())
         top5 = df.ret.nlargest(5).sum()
-        summary.append({"方案": name, "笔数": len(df), "胜率": f"{(df.net > 0).mean():.0%}", "6 个月复利": f"{cv['eq'].iloc[-1] - 1:+.1%}",
+        summary.append({"方案": name, "笔数": len(df), "胜率": f"{(df.net > 0).mean():.0%}", "区间复利": f"{cv['eq'].iloc[-1] - 1:+.1%}",
                         "不复利合计": f"{df.ret.sum():+.1%}", "最大回撤": f"{mdd:.1%}", "最多同时持仓": mx,
                         "去掉最赚 5 笔（不复利）": f"{df.ret.sum() - top5:+.1%}",
                         "多单合计": f"{df[df.side > 0].ret.sum():+.1%}（{(df.side > 0).sum()} 笔）",
