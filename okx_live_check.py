@@ -34,6 +34,7 @@ def main():
         px = float(trader15.ox.ticker(inst)["last"])
         notional = float(n * s["ctVal"]) * px
         total += notional
+        time.sleep(0.5)              # 设置杠杆接口限频较严，逐个慢慢设
         try:
             lt.ensure_leverage(inst, lev); lv = f"已设为逐仓 {lev} 倍"
         except Exception as e:

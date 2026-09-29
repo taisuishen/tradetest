@@ -48,8 +48,9 @@ def creds():
     return {"key": k, "secret": s, "passphrase": p, "simulated": str(sim).lower() in ("1", "true", "yes")}
 
 
-def request(method, path, params=None, body=None, retries=3):
-    """签名请求。GET 的参数拼进 requestPath 一起签名；POST 的 body 用同一个 JSON 字符串签名和发送。"""
+def request(method, path, params=None, body=None, retries=4, idempotent=False):
+    """签名请求。GET 的参数拼进 requestPath 一起签名；POST 的 body 用同一个 JSON 字符串签名和发送。
+    限频 / 繁忙时 GET 和 idempotent=True 的 POST（如设置杠杆，重复调用没有副作用）会退避重试；下单类 POST 不重试。"""
     c = creds()
     if not c:
         raise OkxError("没有配置 OKX API Key（okx_api.json 或环境变量）")
@@ -75,7 +76,7 @@ def request(method, path, params=None, body=None, retries=3):
             continue
         if j.get("code") == "0":
             return j["data"]
-        if j.get("code") in ox.RETRY_CODES and method == "GET":
+        if j.get("code") in ox.RETRY_CODES and (method == "GET" or idempotent) and i < retries - 1:
             last = OkxError(f"{path} -> {j.get('code')} {j.get('msg')}", j.get("code"))
             time.sleep(1 + i)
             continue
@@ -88,8 +89,8 @@ def get(path, **params):
     return request("GET", path, params=params or None)
 
 
-def post(path, body):
-    return request("POST", path, body=body)
+def post(path, body, idempotent=False):
+    return request("POST", path, body=body, idempotent=idempotent)
 
 
 # ---------------- 账户与合约 ----------------
@@ -145,7 +146,7 @@ def ensure_leverage(inst, lever):
     done = _STATE.setdefault("lever", {})
     if done.get(inst) == lever:
         return
-    post("/api/v5/account/set-leverage", {"instId": inst, "lever": str(lever), "mgnMode": "isolated", **_pos_side()})
+    post("/api/v5/account/set-leverage", {"instId": inst, "lever": str(lever), "mgnMode": "isolated", **_pos_side()}, idempotent=True)
     done[inst] = lever
 
 
