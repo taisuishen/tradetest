@@ -26,6 +26,7 @@
       python trader15.py run      只跑一轮
       python trader15.py report   统计
       python trader15.py test-alert   发一条测试告警（检查 Telegram / 群机器人配置）
+      python trader15.py test-trade   在 OKX 模拟盘用最小数量走一遍真实开平仓，确认能收到开平仓推送
 """
 import json
 import logging
@@ -784,6 +785,53 @@ def test_alert():
     print({True: "✅ 推送成功，请查看手机", False: "❌ 推送失败，原因见上面的日志", None: "没有配置任何推送渠道（alert_webhook 或 telegram_*）"}[r])
 
 
+def test_trade():
+    """python trader15.py test-trade [合约]：在 OKX 模拟盘上用最小数量走一遍真实的开仓 → 平仓流程（和策略开仓同一套代码），
+    用来确认 Telegram / 群机器人能收到开平仓推送。用单独的测试数据库，不影响看板统计；只允许模拟盘。"""
+    global DB
+    import okx_trade
+    inst = sys.argv[2] if len(sys.argv) > 2 else "DOGE-USDT-SWAP"
+    cfg = load_cfg(); _CFG.update(cfg)
+    c = okx_trade.creds()
+    if not c or not c["simulated"]:
+        print("test-trade 只允许在 OKX 模拟盘上运行（okx_api.json 里 simulated 需为 true），已拒绝"); return
+    if okx_trade.position(inst):
+        print(f"{inst} 上已有持仓（可能是策略开的），为免干扰不做测试；可换一个合约：python trader15.py test-trade SUI-USDT-SWAP"); return
+    if not cfg.get("alert_trades"):
+        print("提示：alert_trades 没有打开，开平仓不会推送；在 trader15_config.json 里设为 true 后再试")
+    cfg.update(_live="OKX 模拟盘", _live_manage="OKX 模拟盘", live_sizing="fixed", live_size_factor=1.0)
+    _CFG["_live"] = cfg["_live"]
+    DB = ROOT / "trader15_test.db"
+    DB.unlink(missing_ok=True)
+    con = db()
+    sp = okx_trade.spec(inst)
+    qty = float(sp["minSz"] * sp["ctVal"])                   # 最小下单数量（DOGE 0.01 张 = 10 个）
+    price = float(ox.ticker(inst)["last"]); stop = price * 0.97
+    cur = con.execute("""insert into trades(inst, side, point, point_ts, point_px, qty, mult, entry_ts, entry_px, stop, last_checked_ts, context)
+                         values(?,?,?,?,?,?,?,?,?,?,?,?)""", (inst, "long", "测试", now_ms(), price, qty, 1.0, now_ms(), price, stop, now_ms(), "{}"))
+    con.commit(); tid = cur.lastrowid
+    print(f"1) 开仓 {inst} {qty:g} 个（最小数量）…")
+    signal(con, inst, price, "开仓", f"#{tid} 【推送测试】做多 @{price:.6g}，止损 {stop:.6g}（最小数量，约 {qty * price:.2f}U）")
+    live_open(con, cfg, tid, inst, 1, qty, stop)
+    t = con.execute("select * from trades where id=?", (tid,)).fetchone()
+    print(f"   OKX 状态：{t['live_status']}，{t['live_sz']} 张 @{t['live_entry']}｜{t['live_note'] or ''}")
+    if t["live_status"] != "open":
+        con.close(); DB.unlink(missing_ok=True); return
+    print("2) 10 秒后平仓…"); time.sleep(10)
+    px = float(ox.ticker(inst)["last"])
+    close_trade(con, cfg, t, px, now_ms(), "测试")
+    signal(con, inst, px, "平仓", f"#{tid} 【推送测试】按 {px:.6g} 平仓")
+    live_close(con, cfg, tid, inst)
+    for _ in range(10):
+        t = con.execute("select * from trades where id=?", (tid,)).fetchone()
+        if t["live_status"] == "closed":
+            break
+        time.sleep(1); live_reconcile(con, cfg, inst)
+    print(f"3) OKX 状态：{t['live_status']}，净 {t['live_net']}U｜持仓 {okx_trade.position(inst)}｜止损单 {len(okx_trade.pending_stops(inst))} 张")
+    con.close(); DB.unlink(missing_ok=True)
+    print("完成：手机上应收到 4 条推送（开仓、OKX 开多、平仓、OKX 平仓）")
+
+
 LOCK = ROOT / "trader15.lock"
 _LOCK_FH = [None]
 
@@ -868,7 +916,7 @@ if __name__ == "__main__":
     if cmd == "loop":
         atexit.register(lambda: log.info(f"常驻进程退出（PID {os.getpid()}）"))
     try:
-        {"run": run_locked, "report": report, "loop": loop, "test-alert": test_alert}.get(cmd, run_locked)()
+        {"run": run_locked, "report": report, "loop": loop, "test-alert": test_alert, "test-trade": test_trade}.get(cmd, run_locked)()
     except BaseException as e:       # 包括 KeyboardInterrupt / SystemExit，记下退出原因
         log.error(f"进程异常退出：{type(e).__name__} {e}\n{traceback.format_exc()}")
         raise
