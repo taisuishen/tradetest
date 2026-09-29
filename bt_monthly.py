@@ -1,22 +1,28 @@
 """策略 v3 最近 N 天按月收益：多空都做（实盘）/ 只做多 / 只做空，每笔名义 = 开仓时已实现权益 × 1（= 逐仓 10 倍、保证金 10%），复利。
 各方案 × 各品种的撮合互相独立，用多进程并行跑。
 
-用法：python bt_monthly.py [天数=180]      首次运行会拉 K 线并预计算（缓存在 bt/）
+用法：python bt_monthly.py [天数=180]                    最近 N 天
+      python bt_monthly.py 2025-01-01 2026-01-01          指定区间（北京时间，含起不含止）
+      首次运行会拉 K 线并预计算（缓存在 bt/）；费用按 OKX Lv1 标准吃单 0.05%，不计滑点
 """
 import os, sys
 from concurrent.futures import ProcessPoolExecutor
 import pandas as pd
 import chan15_lab2 as L
 
-DAYS = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 180
 TZ = "Asia/Shanghai"
+if len(sys.argv) > 2:                       # 指定区间：按结束时间往前推天数
+    _s, _e = (pd.Timestamp(x, tz=TZ) for x in sys.argv[1:3])
+    DAYS, END_MS = (_e - _s).days, int(_e.timestamp() * 1000)
+else:
+    DAYS, END_MS = (int(sys.argv[1]) if len(sys.argv) > 1 else 180), None
 VARIANTS = {"多空都做（实盘）": {"三买", "三卖"}, "只做多": {"三买"}, "只做空": {"三卖"}}
 _D = {}
 
 
 def _init():
     insts = L.live_insts()
-    _D.update({i: d for i, d in L.load(DAYS, insts, "_live").items() if i in dict(insts)})
+    _D.update({i: d for i, d in L.load(DAYS, insts, "_live", END_MS).items() if i in dict(insts)})
 
 
 def job(args):

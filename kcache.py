@@ -39,8 +39,8 @@ def _fetch_window(inst, bar, after_ms, limiter):
     return [(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[7]), r[8]) for r in rows]
 
 
-def candles(inst, bar, n, workers=6, per_sec=6, progress=True):
-    """返回最近 n 根已收盘 K 线（升序，列同 okx_client.candles）。"""
+def candles(inst, bar, n, workers=6, per_sec=6, progress=True, end_ms=None):
+    """返回最近 n 根已收盘 K 线（升序，列同 okx_client.candles）；给了 end_ms 就返回 end_ms 之前的 n 根（回测历史区间用）。"""
     dur = BAR_MS[bar]
     CACHE.mkdir(exist_ok=True)
     f = CACHE / f"{inst}_{bar}.pkl.gz"
@@ -49,7 +49,7 @@ def candles(inst, bar, n, workers=6, per_sec=6, progress=True):
         with gzip.open(f, "rb") as fh:
             have = pickle.load(fh)
     now = int(time.time() * 1000)
-    end = now // dur * dur                        # 当前未收盘 K 线的开盘时间
+    end = min(end_ms or now, now) // dur * dur    # 当前未收盘 K 线的开盘时间（或指定的结束时间）
     start = end - n * dur
     # 需要补的时间窗口：每段 100 根，"after=X" 返回 X 之前的 100 根
     missing = [t for t in range(start, end, dur) if t not in have]

@@ -52,18 +52,23 @@ def live_insts():
     return tuple((i, c["unit"]) for i, c in trader15.DEFAULT_CFG["instruments"].items())
 
 
-def precompute(days, insts=(("ETH-USDT-SWAP", 1.0), ("BTC-USDT-SWAP", 0.03))):
+def precompute(days, insts=(("ETH-USDT-SWAP", 1.0), ("BTC-USDT-SWAP", 0.03)), end_ms=None):
+    """end_ms：回测区间的结束时间（默认到现在），区间为 end_ms 之前的 days 天。数据不够的品种跳过。"""
     import kcache, fees
     data = {}
     for inst, unit in insts:
         if unit is None:                     # 1 倍 ≈ 2500U 名义价值，和 ETH 1 个、BTC 0.03 个相当
             unit = 2500 / float(kcache.candles(inst, "1H", 2, progress=False).c.iloc[-1])
         t0 = time.time()
-        df15 = kcache.candles(inst, "15m", 400 + days * 96 + 4, progress=False)
-        df1h = kcache.candles(inst, "1H", 400 + days * 24 + 2, progress=False)
-        df4h = kcache.candles(inst, "4H", 300 + days * 6 + 2, progress=False)
-        df5 = kcache.candles(inst, "5m", days * 288 + 12, progress=False)
-        end = int(df15.ts.iloc[-1]) + M15
+        kw = {"progress": False, "end_ms": end_ms, "per_sec": 9}
+        df15 = kcache.candles(inst, "15m", 400 + days * 96 + 4, **kw)
+        if len(df15) < 400:
+            print(f"{inst} 该区间 K 线不足（{len(df15)} 根，可能还没上线），跳过", flush=True)
+            continue
+        df1h = kcache.candles(inst, "1H", 400 + days * 24 + 2, **kw)
+        df4h = kcache.candles(inst, "4H", 300 + days * 6 + 2, **kw)
+        df5 = kcache.candles(inst, "5m", days * 288 + 12, **kw)
+        end = (end_ms // M15 * M15) if end_ms else int(df15.ts.iloc[-1]) + M15
         Ts = list(range(end - days * 96 * M15, end + 1, M15))
         Th = sorted({t // H * H for t in Ts})
         w = max(1, (os.cpu_count() or 2) - 1)
@@ -71,8 +76,9 @@ def precompute(days, insts=(("ETH-USDT-SWAP", 1.0), ("BTC-USDT-SWAP", 0.03))):
             p15 = dict(ex.map(task15, Ts, chunksize=40))
         with ProcessPoolExecutor(w, initializer=lab._init, initargs=({"df1h": df1h, "df4h": df4h},)) as ex:
             p1h = dict(ex.map(lab.task1h, Th, chunksize=10))
-        fm = {"taker": fees.rates(inst)["taker"], "maker": fees.rates(inst)["maker"],
-              "funding": fees.funding_history(inst, int(time.time() * 1000) - (days + 1) * D)}
+        # 回测一律按 OKX Lv1 标准费率，不读账户费率（配了 API Key 时账户费率可能是 VIP 或模拟盘的，会让回测偏乐观）
+        fm = {"taker": fees.DEFAULT["taker"], "maker": fees.DEFAULT["maker"],
+              "funding": [x for x in fees.funding_history(inst, end - (days + 1) * D) if x[0] <= end]}
         data[inst] = (unit, Ts, p15, p1h, list(zip(df5.ts.astype("int64"), df5.h, df5.l, df5.c)), fm)
         print(f"{inst} 预计算 {time.time() - t0:.0f}s", flush=True)
     return data
@@ -322,12 +328,16 @@ def stats(df, days):
             "净利": round(df.net.sum()), "每笔R": round(df.R.mean(), 2), "手续费": round(df.fee.sum()), "回撤": round(mdd), "去前5": round(df.net.sum() - df.net.nlargest(5).sum())}
 
 
-def load(days=90, insts=None, name=""):
+def load(days=90, insts=None, name="", end_ms=None):
     OUT.mkdir(exist_ok=True)
-    f = OUT / f"lab2_{days}{name}.pkl"
+    f = OUT / f"lab2_{days}{name}{'_' + time.strftime('%Y%m%d', time.gmtime(end_ms / 1000)) if end_ms else ''}.pkl"
     if not f.exists():
-        pickle.dump(precompute(days, insts) if insts else precompute(days), open(f, "wb"))
-    return pickle.load(open(f, "rb"))
+        pickle.dump(precompute(days, insts or (("ETH-USDT-SWAP", 1.0), ("BTC-USDT-SWAP", 0.03)), end_ms), open(f, "wb"))
+    data = pickle.load(open(f, "rb"))
+    import fees
+    for v in data.values():                  # 旧缓存可能存的是账户费率：统一改回 Lv1 标准费率
+        v[5]["taker"], v[5]["maker"] = fees.DEFAULT["taker"], fees.DEFAULT["maker"]
+    return data
 
 
 def compare(data, variants, recent=30, total=90):
