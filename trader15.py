@@ -569,6 +569,17 @@ def write_dashboard(con, cfg):
                  else f"数量 = 模拟仓位 × {cfg.get('live_size_factor', 1.0):g}")
     live_desc = (f"{live_now}同步下单（逐仓 {lev_} 倍，{live_size}）"
                  if live_now else "只模拟，不下真实单")
+    live_bal = ""
+    if live_now:
+        try:
+            import okx_trade
+            b = okx_trade.balance_usdt()
+            per_txt = (f"每笔 OKX 名义约 {b['eq'] * frac_:,.0f}U（保证金约 {b['eq'] * frac_ / lev_:,.0f}U）"
+                   if cfg.get("live_sizing", "equity") == "equity" else "每笔 OKX 数量 = 模拟 1 倍数量 × " + f"{cfg.get('live_size_factor', 1.0):g}")
+            live_bal = (f'<div class="card"><b>OKX 账户</b>｜USDT 权益 {b["eq"]:,.2f}U，可用 {b["availBal"]:,.2f}U｜{per_txt}'
+                        f'｜模拟交易固定每个品种约 2500U（与回测一致），OKX 按权益开仓，两边盈亏金额不同，比较看收益率</div>')
+        except Exception as e:
+            live_bal = f'<div class="card muted">OKX 账户余额暂时读取失败：{str(e)[:120]}</div>'
     pts = [0.0] + s["curve"]
     if len(pts) > 1:
         lo_, hi_ = min(pts), max(pts); sp = (hi_ - lo_) or 1; W, Hh = 600, 160
@@ -627,6 +638,7 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
 {health}
 <div class="muted">{live_desc}｜策略 v{cfg.get('strategy_version', 1)}｜{len(cfg['instruments'])} 个品种｜15m {' / '.join(cfg['entry_points'])}入场，区间套（1H 缠论）+ 大方向 + 只做趋势（1H 趋势效率≥{cfg['min_trend_eff_1h']:.0%}）{zs_desc}｜{size_desc}｜止损在买卖点外 0.5 ATR，反向买卖点离场｜
 {fee_desc}，不计滑点｜常驻循环实时扫描｜开始于 {bj(first)}｜更新于 {datetime.now(TZ):%m-%d %H:%M:%S}</div>
+{live_bal}
 <div class="grid">
 <div class="kpi"><span>胜率</span><b>{s['wr']:.1f}%</b><span>{s['w']} 胜 / {s['l']} 负</span></div>
 <div class="kpi"><span>净利润</span><b>{money(s['net'])} U</b><span>毛利 {s['gross']:+.2f}</span></div>
@@ -637,7 +649,7 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
 </div>
 <div class="card"><h2>权益曲线（净利润累计）</h2>{svg}</div>
 <div class="card"><h2>当前持仓</h2><table><tr><th>合约</th><th>方向</th><th>倍数</th><th>评分</th><th>入场</th><th>现价</th><th>止损</th><th>浮盈U</th><th>开仓</th><th>OKX</th></tr>{open_rows}</table></div>
-<div class="card"><h2>分合约</h2><table><tr><th>合约</th><th>1倍数量</th><th>笔数</th><th>胜率</th><th>净利U</th><th>手续费U</th><th>最大回撤U</th></tr>{per_rows}</table></div>
+<div class="card"><h2>分合约</h2><table><tr><th>合约</th><th>模拟 1 倍数量</th><th>笔数</th><th>胜率</th><th>净利U</th><th>手续费U</th><th>最大回撤U</th></tr>{per_rows}</table></div>
 <div class="card"><h2>已平仓（最近 100 笔）</h2><table><tr><th>#</th><th>合约</th><th>买卖点</th><th>开仓</th><th>平仓</th><th>入场</th><th>出场</th><th>结果</th><th>倍数</th><th>手续费</th><th>资金费</th><th>净利U</th><th>OKX 净利U</th></tr>{closed_rows}</table></div>
 <div class="card"><h2>最近分析记录</h2><table><tr><th>时间</th><th>合约</th><th>决策</th><th>说明</th></tr>{sig_rows}</table></div>
 </body></html>"""
