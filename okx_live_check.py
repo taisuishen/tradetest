@@ -1,0 +1,79 @@
+"""
+OKX 下单前自检（在绑定了 IP 白名单的服务器上运行）。
+
+  python okx_live_check.py             只读检查：Key 能否登录、账户模式、USDT 余额、每个品种的下单张数，并设置逐仓杠杆
+  python okx_live_check.py roundtrip   另外在【模拟盘】上用最小数量完整走一遍：开多 + 附带止损 → 核对止损单 → 平仓 → 撤单 → 读仓位历史
+                                       （只允许模拟盘；Key 不是模拟盘会直接拒绝）
+"""
+import sys
+import time
+
+import okx_trade as lt
+import trader15
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8")
+    cfg = trader15.load_cfg()
+    c = lt.creds()
+    if not c:
+        print("没有找到 API Key：请填写 okx_api.json（见 okx_api.example.json）"); return 1
+    print(f"Key：{'模拟盘' if c['simulated'] else '【实盘】'}")
+    a = lt.account()
+    print(f"账户等级 acctLv={a['acctLv']}（1 简单 2 单币种保证金 3 跨币种 4 组合）｜持仓模式 {a['posMode']}")
+    lt.check_account()
+    b = lt.balance_usdt()
+    print(f"USDT 权益 {b['eq']:.2f}，可用 {b['availBal']:.2f}")
+    lev = cfg["live_leverage"]; k = cfg["live_size_factor"]
+    total = 0.0
+    print(f"\n逐仓 {lev} 倍，下单数量 = 模拟仓位 × {k:g}：")
+    for inst, ic in cfg["instruments"].items():
+        s = lt.spec(inst)
+        qty = ic["unit"] * k
+        n = lt.contracts(inst, qty)
+        px = float(trader15.ox.ticker(inst)["last"])
+        notional = float(n * s["ctVal"]) * px
+        total += notional
+        try:
+            lt.ensure_leverage(inst, lev); lv = f"已设为逐仓 {lev} 倍"
+        except Exception as e:
+            lv = f"设置杠杆失败：{e}"
+        print(f"  {inst:16s} {qty:g} 个币 → {lt.num(n)} 张（每张 {s['ctVal']}，最小 {s['minSz']}）≈ {notional:,.0f}U，保证金约 {notional / lev:,.0f}U｜{lv}")
+    print(f"\n全部品种同时持仓：名义 {total:,.0f}U，逐仓保证金约 {total / lev:,.0f}U（可用 {b['availBal']:,.0f}U）")
+    if total / lev > b["availBal"]:
+        print("  ⚠️ 可用余额不够所有品种同时开仓，满仓时后面的单子会因保证金不足失败")
+    if len(sys.argv) > 1 and sys.argv[1] == "roundtrip":
+        if not c["simulated"]:
+            print("\nroundtrip 只允许在模拟盘上运行（okx_api.json 里 simulated 需为 true），已拒绝"); return 1
+        roundtrip(sys.argv[2] if len(sys.argv) > 2 else "DOGE-USDT-SWAP", lev)
+    return 0
+
+
+def roundtrip(inst, lev):
+    print(f"\n== 模拟盘完整流程测试：{inst} ==")
+    if lt.position(inst):
+        print("该合约已有逐仓多单，为免干扰，不做测试"); return
+    s = lt.spec(inst)
+    px = float(trader15.ox.ticker(inst)["last"])
+    qty = float(s["minSz"] * s["ctVal"])
+    t0 = int(time.time() * 1000)
+    r = lt.open_long(inst, qty, px * 0.97, lev, 0)
+    print(f"1. 开多 {r['sz']:g} 张 @{r['avgPx']}，手续费 {r['fee']:.4f}U，止损 {r['stop']}{'；' + r['note'] if r.get('note') else ''}")
+    p = lt.position(inst)
+    print(f"2. 交易所持仓：{p}")
+    st = lt.pending_stops(inst)
+    print(f"3. 挂着的止损单：{[(x.get('ordType'), x.get('slTriggerPx'), x.get('sz'), x.get('state')) for x in st]}")
+    time.sleep(2)
+    print(f"4. 平仓：{'已下平仓单' if lt.close_long(inst, 0) else '已无持仓'}；剩余止损单 {len(lt.pending_stops(inst))} 张；持仓 {lt.position(inst)}")
+    for i in range(10):
+        rec = lt.closed_record(inst, t0)
+        if rec:
+            print(f"5. 仓位历史：{rec}"); break
+        time.sleep(1)
+    else:
+        print("5. 10 秒内仓位历史还没出来（稍后在 OKX 页面核对）")
+    print("完整流程测试通过" if rec and not lt.position(inst) and not lt.pending_stops(inst) else "⚠️ 有步骤不符合预期，请把以上输出发给我")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

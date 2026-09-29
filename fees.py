@@ -4,20 +4,13 @@ OKX 合约真实费用：交易手续费 + 资金费（回测与实盘共用）�
 交易手续费：成交金额 × 费率。开仓、止损、反向离场都是市价单，按吃单（taker）费率，开平各收一次。
   - 配置了 OKX 只读 API Key 时，调用 /api/v5/account/trade-fee 取账户真实费率（与 VIP 等级有关），缓存 24 小时
   - 否则用 OKX 普通用户 Lv1 U 本位永续标准费率：挂单 0.02%，吃单 0.05%
-  API Key 放环境变量 OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE，或 okx_api.json（已在 .gitignore 里）
+  API Key 放环境变量 OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE，或 okx_api.json（已在 .gitignore 里），读取与签名见 okx_trade.py
 资金费：持仓期间每经过一个结算时刻，按 OKX 实际资金费率计：费用 = 方向 × 费率 × 持仓数量 × 开仓价
   （费率为正时多单付、空单收；用开仓价近似结算时的持仓价值）
 """
-import base64
-import hashlib
-import hmac
 import json
-import os
 import time
-from datetime import datetime, timezone
 from pathlib import Path
-
-import requests
 
 import okx_client as ox
 
@@ -27,24 +20,13 @@ DEFAULT = {"taker": 0.0005, "maker": 0.0002, "source": "OKX 普通用户 Lv1 标
 
 
 def _creds():
-    k, s, p = os.environ.get("OKX_API_KEY"), os.environ.get("OKX_API_SECRET"), os.environ.get("OKX_API_PASSPHRASE")
-    f = ROOT / "okx_api.json"
-    if not k and f.exists():
-        c = json.loads(f.read_text(encoding="utf-8"))
-        k, s, p = c.get("api_key"), c.get("secret"), c.get("passphrase")
-    return (k, s, p) if k and s and p else None
+    import okx_trade            # Key 的读取与签名统一在 okx_trade（含模拟盘请求头）
+    return okx_trade.creds()
 
 
 def _signed_get(path, creds):
-    k, s, p = creds
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
-    sign = base64.b64encode(hmac.new(s.encode(), (ts + "GET" + path).encode(), hashlib.sha256).digest()).decode()
-    r = requests.get(ox.BASE + path, timeout=15, headers={"OK-ACCESS-KEY": k, "OK-ACCESS-SIGN": sign,
-                                                         "OK-ACCESS-TIMESTAMP": ts, "OK-ACCESS-PASSPHRASE": p})
-    j = r.json()
-    if j.get("code") != "0":
-        raise RuntimeError(f"{path} -> {j.get('code')} {j.get('msg')}")
-    return j["data"]
+    import okx_trade
+    return okx_trade.request("GET", path)
 
 
 def rates(inst):

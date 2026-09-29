@@ -1,6 +1,7 @@
 {
-  "_说明": "可选。复制为 okx_api.json 并填写 OKX【只读】API Key，用于获取你账户的真实手续费率（与 VIP 等级有关）。不填则按 Lv1 标准费率：吃单 0.05%。创建 Key 时只勾选“读取”权限，不要勾选交易和提现。okx_api.json 已在 .gitignore 中，不会上传。",
+  "_说明": "复制为 okx_api.json 并填写。只读 Key：用于读取账户真实手续费率；带交易权限的 Key：用于 trader15_config.json 里 live_trading=true 时同步下单（一律逐仓）。simulated=true 表示 OKX 模拟盘 Key（请求带 x-simulated-trading: 1）；真实账户 Key 设为 false，且还需在 trader15_config.json 里把 live_allow_real 设为 true 才会真的下单。创建 Key 时不要勾选提现，并绑定服务器 IP 白名单。okx_api.json 已在 .gitignore 中，不会上传。",
   "api_key": "",
   "secret": "",
-  "passphrase": ""
+  "passphrase": "",
+  "simulated": true
 }

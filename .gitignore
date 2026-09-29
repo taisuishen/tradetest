@@ -10,7 +10,7 @@ web/
 paper_config.json
 __pycache__/
 .venv/
-trader15_config.json
+trader15_config*.json
 heartbeat.json
 *.lock
 okx_api.json
