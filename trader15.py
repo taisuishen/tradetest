@@ -1,7 +1,7 @@
 """
 15 分钟级缠论单仓交易（默认只模拟；live_trading=true 时同步下单到 OKX）。
 
-规则 v4（chan15_lab2.py 控制变量测试 + bt_monthly.py 按月回测：8 个品种、窄中枢、只做多）：
+规则 v5（chan15_lab2.py 控制变量测试 + bt_v5.py 两段回测：8 个品种、窄中枢、只做多、不追高、低效率信号需指标确认）：
   品种：ETH / BTC / SOL / XRP / DOGE / SUI / ZEC / HYPE，每个品种各自一个仓位，1 倍 ≈ 2500U 名义价值
   入场：15m 新确认的三买做多，按当前价成交（不计滑点），不加仓；不做空
         （2025 全年样本外回测：空单 145 笔全年 −34%，连 BTC −17% 的 11 月也亏；只做多 +83% / 回撤 24.8%。
@@ -9,9 +9,13 @@
   仓位：固定 1 倍（与回测一致）；sizing=step 可改回按评分分档 0.5 / 1 / 2 / 3 / 5 倍（sizing.py）
   过滤：① 大方向：1H*0.6 + 4H*0.4 趋势分不能明显相反（多单要求 > -1，空单要求 < +1）
         ② 区间套：1H 缠论方向（走势 + 近期买卖点）不能相反
-        ③ 行情性质：只做趋势——1H 近 48 根 K 线趋势效率（净涨跌 / 逐根涨跌绝对值之和）≥ 20%
+        ③ 行情性质：只做趋势——1H 近 48 根 K 线趋势效率（净涨跌 / 逐根涨跌绝对值之和）≥ 20%；
+           10–20% 的低效率信号需 TradeTrack 多周期指标评分确认（1H ≥ 40 且 4H ≥ 20，ttrack.py）
         ④ 窄中枢：15m 最近中枢宽度（ZG − ZD）≤ 1.5 倍 ATR(15m)，宽幅震荡后的突破不做
            （8 品种 90 天回测：胜率 25–28% → 50%，回撤约降到三分之一）
+        ⑤ 不追高：现价离买卖点不超过 1.75 倍 ATR(15m)
+        （v5 两段回测，每笔名义 = 权益 × 1 复利：最近 180 天 v4 +141% / 回撤 17% → +277% / 15%；
+          2025 全年 +83% / 25% → +115% / 17%）
   止损：买卖点价格外 0.5 ATR(15m)；用 1 分钟 K 线高低点逐根判定，按止损价原价成交
   离场：止损，或持仓中 15m 出现反向买卖点（按当时价格平仓）；不设固定止盈
   费用：交易手续费 = 成交金额 × OKX 吃单费率（开平各一次；配置只读 API Key 时用账户真实费率，否则 Lv1 标准 0.05%），
@@ -43,7 +47,7 @@ import ta  # noqa: E402
 
 TZ = timezone(timedelta(hours=8))
 CFG_PATH = ROOT / "trader15_config.json"
-STRATEGY_VERSION = 4
+STRATEGY_VERSION = 5
 DEFAULT_CFG = {
     "strategy_version": STRATEGY_VERSION,
     # 1 倍 ≈ 2500U 名义价值（按 2026-09 价格折算）
@@ -57,6 +61,10 @@ DEFAULT_CFG = {
     "trend_threshold": 1.0,
     "nest_filter": True,
     "min_trend_eff_1h": 0.20,  # 1H 趋势效率下限，0 表示不过滤
+    "weak_eff_min": 0.10,      # 1H 趋势效率在 [weak_eff_min, min_trend_eff_1h) 的“低效率”信号，需 TradeTrack 评分确认才做（ttrack.py）
+    "weak_tt_1h": 40,          # 低效率信号要求 TradeTrack 1H 评分（多单 ≥，空单 ≤ 负值）
+    "weak_tt_4h": 20,          # 低效率信号要求 TradeTrack 4H 评分
+    "max_chase_atr": 1.75,     # 现价离买卖点超过几倍 ATR(15m) 就不追，0 表示不限
     "max_zs_width_atr": 1.5,   # 15m 最近中枢宽度上限（倍 ATR），0 表示不过滤
     "loop_interval_sec": 1,    # 常驻模式两轮之间的最短间隔（秒），0 表示算完马上接着算
     "sizing": "",              # 动态仓位：step=按评分分档 0.5/1/2/3/5 倍，linear=0.5~5 倍线性，""=固定 1 倍（见 sizing.py）
@@ -100,7 +108,8 @@ STRATEGY_KEYS = ("instruments", "entry_points", "min_trend_eff_1h", "max_zs_widt
 
 def migrate_cfg(raw):
     """旧版配置升级到当前策略，先备份旧配置。
-    v1 → 当前：覆盖全部策略项（v1 与之后的规则差别很大）。v2 / v3 → 当前：只改入场点（v4 为只做多）。
+    v1 → 当前：覆盖全部策略项（v1 与之后的规则差别很大）。v2 / v3 / v4 → 当前：只改入场点（v4 起只做多）；
+    v5 新增的设置项（weak_* / max_chase_atr）由 load_cfg 自动补上默认值。
     已平仓记录归档到 trader15_v{旧版本}.db，新策略从零开始统计；未平仓位（含 OKX 上在跟踪的）带到新库继续管理。"""
     user = json.loads(raw)
     old = user.get("strategy_version", 1)
@@ -471,16 +480,30 @@ def handle(con, cfg, inst, unit):
     c48 = df1h.c.values[-49:]
     eff = abs(c48[-1] - c48[0]) / (sum(abs(c48[i] - c48[i - 1]) for i in range(1, len(c48))) or 1)
     notes = []
-    if eff < cfg["min_trend_eff_1h"]:
-        signal(con, inst, price, "放弃", f"{'、'.join(c[0] for c in cands)}：1H 趋势效率 {eff:.0%} < {cfg['min_trend_eff_1h']:.0%}，"
+    weak_min = cfg.get("weak_eff_min") or cfg["min_trend_eff_1h"]
+    if eff < weak_min:
+        signal(con, inst, price, "放弃", f"{'、'.join(c[0] for c in cands)}：1H 趋势效率 {eff:.0%} < {weak_min:.0%}，"
                                         f"行情在震荡，不做震荡里的突破")
         return
+    weak = bool(eff < cfg["min_trend_eff_1h"])    # 低效率（弱）信号：要 TradeTrack 1H / 4H 指标评分确认
+    tt = {}
+    if weak:
+        import ttrack
+        for tf, dfx in (("1H", df1h), ("4H", df4h)):
+            x = dfx.iloc[-300:]
+            r = ttrack.analyze(x.o.values, x.h.values, x.l.values, x.c.values, x.volQuote.values, price, tf)
+            tt[tf] = r["score"] if r else 0
     for tp, ts_, px in cands:
         side = 1 if tp in LONG else -1
         if cfg["trend_filter"] and trend * side <= -cfg["trend_threshold"]:
             notes.append(f"{tp}与大方向相反（趋势分 {trend:+.2f}）"); continue
         if cfg["nest_filter"] and bias * side < 0:
             notes.append(f"{tp}与 1H 缠论方向相反（1H 走势{ch1['trend']}，近期{ch1.get('recent') or '无'}）"); continue
+        if weak and (tt["1H"] * side < cfg.get("weak_tt_1h", 40) or tt["4H"] * side < cfg.get("weak_tt_4h", 20)):
+            notes.append(f"{tp}：1H 趋势效率 {eff:.0%} 偏低，TradeTrack 评分 1H {tt['1H']:+d} / 4H {tt['4H']:+d} "
+                         f"未达 {cfg.get('weak_tt_1h', 40)} / {cfg.get('weak_tt_4h', 20)}，不做"); continue
+        if cfg.get("max_chase_atr") and (price - px) * side > cfg["max_chase_atr"] * atr:
+            notes.append(f"{tp}：现价离买卖点 {px:.6g} 已 {(price - px) * side / atr:.2f} 倍 ATR > {cfg['max_chase_atr']:g}，追得太高不做"); continue
         stop = px - side * cfg["stop_buffer_atr"] * atr
         if (stop - price) * side >= 0:
             notes.append(f"{tp}（{px:.6g}）已被价格打穿，结构失效"); continue
@@ -493,13 +516,15 @@ def handle(con, cfg, inst, unit):
         mult = sizing.size_from_score(score, cfg["sizing"]) if cfg.get("sizing") else 1.0
         qty = unit * mult
         ctx = {"trend": round(trend, 2), "chan1h_trend": ch1["trend"], "chan1h_bias": bias, "atr15": round(atr, 6),
-               "trend_eff_1h": round(eff, 3), "adx4h": round(adx4h, 1), "score": round(score, 3), "zs_w_atr": zs_w and round(zs_w, 2)}
+               "trend_eff_1h": round(eff, 3), "adx4h": round(adx4h, 1), "score": round(score, 3), "zs_w_atr": zs_w and round(zs_w, 2),
+               "chase_atr": round((price - px) * side / atr, 2), "weak": weak, **({"tt1h": tt["1H"], "tt4h": tt["4H"]} if weak else {})}
         cur = con.execute("""insert into trades(inst, side, point, point_ts, point_px, qty, mult, entry_ts, entry_px, stop,
                              last_checked_ts, context) values(?,?,?,?,?,?,?,?,?,?,?,?)""",
                           (inst, "long" if side > 0 else "short", tp, ts_, px, qty, mult, ts_now, price, stop,
                            ts_now // 60_000 * 60_000 + 60_000, json.dumps(ctx, ensure_ascii=False)))
         con.commit()
-        signal(con, inst, price, "开仓", f"#{cur.lastrowid} {tp}{'做多' if side > 0 else '做空'} {mult:g} 倍（评分 {score:.2f}）@{price:.6g}"
+        wk = f"【低效率信号，TradeTrack 确认 1H {tt['1H']:+d} / 4H {tt['4H']:+d}】" if weak else ""
+        signal(con, inst, price, "开仓", f"#{cur.lastrowid} {tp}{'做多' if side > 0 else '做空'}{wk} {mult:g} 倍（评分 {score:.2f}）@{price:.6g}"
                                         f"（买卖点 {px:.6g}），止损 {stop:.6g}，风险 {abs(price - stop) * qty:.2f}U；"
                                         f"大方向 {trend:+.2f}，1H 缠论{ch1['trend']}，1H 趋势效率 {eff:.0%}，15m 中枢宽 {'-' if zs_w is None else f'{zs_w:.2f}'} ATR，4H ADX {adx4h:.0f}")
         if cfg.get("_live"):
@@ -641,7 +666,10 @@ def write_dashboard(con, cfg):
         fee_desc = f"手续费按 OKX 吃单费率 {r_['taker'] * 100:.3f}%（{r_['source']}），另计实际资金费"
     else:
         fee_desc = f"每笔每 1 倍扣 {cfg['fee_per_unit']}U"
-    zs_desc = f"+ 窄中枢（≤{cfg['max_zs_width_atr']:g} ATR）" if cfg.get("max_zs_width_atr") else ""
+    zs_desc = (f"+ 窄中枢（≤{cfg['max_zs_width_atr']:g} ATR）" if cfg.get("max_zs_width_atr") else "") + \
+              (f" + 不追高（≤{cfg['max_chase_atr']:g} ATR）" if cfg.get("max_chase_atr") else "") + \
+              (f" + 效率 {cfg['weak_eff_min']:.0%}–{cfg['min_trend_eff_1h']:.0%} 需指标确认（1H≥{cfg.get('weak_tt_1h', 40)} 4H≥{cfg.get('weak_tt_4h', 20)}）"
+               if cfg.get("weak_eff_min") and cfg["weak_eff_min"] < cfg["min_trend_eff_1h"] else "")
     size_desc = "按强弱动态 0.5~5 倍" if cfg.get("sizing") else "固定 1 倍"
     hb = read_heartbeat()
     ce = hb.get("consecutive_errors", 0)

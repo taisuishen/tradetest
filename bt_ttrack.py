@@ -49,8 +49,8 @@ def _feat(args):
     return T, out
 
 
-def features(data, days):
-    """给最近 days 天的每根 15m 收盘算 TradeTrack 特征，按合约缓存到 bt/。"""
+def features(data, days, end_ms=None):
+    """给 data 里最后 days 天的每根 15m 收盘算 TradeTrack 特征，按合约缓存到 bt/。end_ms：历史区间的结束时间。"""
     import kcache
     res = {}
     for inst, d in data.items():
@@ -61,7 +61,7 @@ def features(data, days):
         t0 = time.time()
         arrs = {}
         for tf in BAR:
-            k = kcache.candles(inst, tf, days * 96 * M15 // BAR[tf] + 320, progress=False, per_sec=9)
+            k = kcache.candles(inst, tf, days * 96 * M15 // BAR[tf] + 320, progress=False, per_sec=9, end_ms=end_ms)
             arrs[(inst, tf)] = (k.ts.values.astype("int64"), k.o.values, k.h.values, k.l.values, k.c.values, k.volQuote.values)
         with ProcessPoolExecutor(max(1, (os.cpu_count() or 2) - 1), initializer=_init, initargs=(arrs,)) as ex:
             res[inst] = dict(ex.map(_feat, [(inst, T) for T in Ts], chunksize=32))
