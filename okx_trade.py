@@ -26,6 +26,7 @@ import okx_client as ox
 
 ROOT = Path(__file__).parent
 _session = requests.Session()
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 _STATE = {}          # 进程内缓存：账户配置、合约规格、已设置过杠杆的合约
 
 
@@ -59,10 +60,12 @@ def request(method, path, params=None, body=None, retries=4, idempotent=False):
     data = json.dumps(body, separators=(",", ":")) if body is not None else ""
     last = None
     for i in range(retries):
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        now = datetime.fromtimestamp(time.time() + _STATE.get("clock_offset", 0.0), timezone.utc)   # 按 OKX 服务器时间校正
+        ts = now.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         sign = base64.b64encode(hmac.new(c["secret"].encode(), (ts + method + path + data).encode(), hashlib.sha256).digest()).decode()
         headers = {"OK-ACCESS-KEY": c["key"], "OK-ACCESS-SIGN": sign, "OK-ACCESS-TIMESTAMP": ts,
-                   "OK-ACCESS-PASSPHRASE": c["passphrase"], "Content-Type": "application/json"}
+                   "OK-ACCESS-PASSPHRASE": c["passphrase"], "Content-Type": "application/json",
+                   "User-Agent": UA}          # 默认的 python-requests UA 有时会被 OKX 的 Cloudflare 拦截（1010）
         if c["simulated"]:
             headers["x-simulated-trading"] = "1"
         try:
@@ -76,6 +79,11 @@ def request(method, path, params=None, body=None, retries=4, idempotent=False):
             continue
         if j.get("code") == "0":
             return j["data"]
+        if j.get("code") == "50102" and i < retries - 1:       # 时间戳过期（本机时钟不准）：和 OKX 对时后重试，被拒的请求不会成交
+            srv = int(ox.get("/api/v5/public/time")[0]["ts"]) / 1000
+            _STATE["clock_offset"] = srv - time.time()
+            last = OkxError(f"{path} -> 50102 时间戳过期，已与 OKX 对时（本机偏差 {_STATE['clock_offset']:+.1f} 秒）", "50102")
+            continue
         if j.get("code") in ox.RETRY_CODES and (method == "GET" or idempotent) and i < retries - 1:
             last = OkxError(f"{path} -> {j.get('code')} {j.get('msg')}", j.get("code"))
             time.sleep(1 + i)
@@ -216,6 +224,7 @@ def open_position(inst, side, qty, stop_px, lever, tid):
     capped = sz > spec(inst)["maxMktSz"]
     if capped:
         sz = spec(inst)["maxMktSz"]
+    cancel_stops(inst)            # 没有仓位时挂着的止损单都是残留（旧仓位的），先撤掉，免得误以为新仓位已有止损
     ensure_leverage(inst, lever, side)
     stop = price_str(inst, stop_px, side)
     cl = _cl_id("t15o", tid)
@@ -228,7 +237,7 @@ def open_position(inst, side, qty, stop_px, lever, tid):
         raise OkxError(f"{inst} 市价单未成交（状态 {o.get('state')}）")
     res = {"sz": float(o["accFillSz"]), "avgPx": float(o["avgPx"]), "fee": -float(o.get("fee") or 0), "ordId": r["ordId"], "stop": float(stop)}
     time.sleep(0.5)
-    note = ensure_stop(inst, side, stop_px, tid)
+    note = ensure_stop(inst, side, stop_px, tid, sz_hint=o["accFillSz"])
     if capped:
         note = (note + f"；数量超过单笔市价单上限，按上限 {num(sz)} 张下单").lstrip("；")
     pos = position(inst, side)
@@ -243,18 +252,24 @@ def open_long(inst, qty, stop_px, lever, tid):
     return open_position(inst, 1, qty, stop_px, lever, tid)
 
 
-def ensure_stop(inst, side, stop_px, tid=0):
+def ensure_stop(inst, side, stop_px, tid=0, sz_hint=None):
     """确认交易所上挂着止损单；没有就按当前持仓补挂一张（只减仓、最新价触发、市价成交），补挂失败就立即平仓。
-    返回说明文字（已有止损时为空）。"""
-    if pending_stops(inst):
-        return ""
-    pos = position(inst, side)
-    if not pos:
-        return ""
+    刚成交时持仓 / 附带止损可能要几百毫秒才查得到，所以先等几次再下结论。返回说明文字（已有止损时为空）。"""
+    pos = None
+    for k in range(4):
+        if pending_stops(inst):
+            return ""
+        pos = position(inst, side)
+        if pos:
+            break
+        time.sleep(0.5)
+    sz = str(pos["sz"]) if pos else sz_hint
+    if not sz:
+        return ""                  # 交易所上确实没有这笔仓位（例如已经被平掉），不用挂止损
     stop = price_str(inst, stop_px, side)
     try:
         post("/api/v5/trade/order-algo", {"instId": inst, "tdMode": "isolated", "side": "sell" if side > 0 else "buy",
-                                          "ordType": "conditional", "sz": num(str(pos["sz"])), "reduceOnly": "true", **_pos_side(side),
+                                          "ordType": "conditional", "sz": num(sz), "reduceOnly": "true", **_pos_side(side),
                                           "slTriggerPx": stop, "slOrdPx": "-1", "slTriggerPxType": "last"})
         return f"止损单未生效，已补挂止损 {stop}"
     except Exception as e:

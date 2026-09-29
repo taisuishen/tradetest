@@ -83,6 +83,7 @@ DEFAULT_CFG = {
     "live_equity_frac": 1.0,    # equity 模式下每笔名义价值占权益的比例（1.0 = 每笔 1 倍，10 倍杠杆时每笔保证金 = 权益 10%；多个品种同时持仓时合计会超过 1 倍）
     "live_size_factor": 1.0,    # fixed 模式：OKX 下单数量 = 模拟仓位数量 × 该系数（1.0 即每个品种约 2500U 名义价值）
     "live_allow_real": False,   # 安全锁：Key 不是模拟盘（okx_api.json 里 simulated 不为 true）时，必须设为 true 才会下真实订单
+    "live_max_positions": 0,    # OKX 上最多同时持有几笔（0 = 不限）；按权益 × 1 开仓时，同时 N 笔 = 合计 N 倍名义
 }
 LONG = {"一买", "二买", "三买", "盘背买"}
 SHORT = {"一卖", "二卖", "三卖", "盘背卖"}
@@ -215,7 +216,7 @@ _LAST_DASH = [0.0]
 def alert(cfg, text):
     """推送告警；失败只记日志，不影响交易逻辑。"""
     import requests
-    text = f"【模拟交易】{text}"
+    text = f"【{_CFG.get('_live') or '模拟交易'}】{text}"
     try:
         if cfg.get("alert_webhook"):   # 钉钉 / 企业微信群机器人通用格式
             requests.post(cfg["alert_webhook"], json={"msgtype": "text", "text": {"content": text}}, timeout=10)
@@ -297,17 +298,28 @@ _LIVE_WARNED = set()
 
 
 def live_mode(cfg):
-    """返回 (模式说明或 None, 错误说明或 None)。模式说明：“OKX 模拟盘” / “OKX 实盘”。"""
+    """返回 (开新仓的模式或 None, 错误说明或 None)。模式说明：“OKX 模拟盘” / “OKX 实盘”。"""
+    manage = live_manage_mode(cfg)
     if not cfg.get("live_trading"):
         return None, None
     import okx_trade
     c = okx_trade.creds()
     if not c:
         return None, "已开启 live_trading，但没有配置 OKX API Key（okx_api.json 或环境变量），本轮只做模拟交易"
-    if not c["simulated"] and not cfg.get("live_allow_real"):
+    if not manage:
         return None, ("已开启 live_trading，Key 不是模拟盘（okx_api.json 里 simulated 不为 true），"
                       "但 live_allow_real 没有设为 true：安全锁生效，不下真实订单")
-    return ("OKX 模拟盘" if c["simulated"] else "OKX 实盘"), None
+    return manage, None
+
+
+def live_manage_mode(cfg):
+    """管理已有 OKX 持仓（对账、跟着策略平仓）的模式。关掉 live_trading 只停止开新仓，已有持仓照常管理到平掉为止；
+    实盘 Key 仍受 live_allow_real 安全锁约束。"""
+    import okx_trade
+    c = okx_trade.creds()
+    if not c or (not c["simulated"] and not cfg.get("live_allow_real")):
+        return None
+    return "OKX 模拟盘" if c["simulated"] else "OKX 实盘"
 
 
 def live_qty(cfg, inst, qty):
@@ -330,6 +342,15 @@ def live_qty(cfg, inst, qty):
 def live_open(con, cfg, tid, inst, side, qty, stop):
     import okx_trade
     lev = cfg.get("live_leverage", 10)
+    cap = cfg.get("live_max_positions") or 0
+    if cap:
+        n = con.execute("select count(*) from trades where live_status in ('open', 'opening')").fetchone()[0]
+        if n >= cap:
+            con.execute("update trades set live_status='skipped', live_note=? where id=?", (f"OKX 已有 {n} 笔持仓，达到上限 {cap}", tid)); con.commit()
+            signal(con, inst, None, "实盘", f"#{tid} OKX 已有 {n} 笔持仓，达到 live_max_positions={cap}，这笔只做模拟")
+            return
+    # 先记“下单中”：万一下单途中进程被杀，重启后对账会按交易所实际持仓认领，不会留下没人管的仓位
+    con.execute("update trades set live_status='opening' where id=?", (tid,)); con.commit()
     try:
         q, size_note = live_qty(cfg, inst, qty)
         r = okx_trade.open_position(inst, side, q, stop, lev, tid)
@@ -366,8 +387,10 @@ def live_close(con, cfg, tid, inst):
     try:
         okx_trade.close_position(inst, _side(t), tid)
     except Exception as e:
-        signal(con, inst, None, "错误", f"#{tid} OKX 平仓失败，下一轮重试（止损单仍在交易所上）：{e}"[:300])
-        alert(cfg, f"[{inst}] #{tid} OKX 平仓失败：{e}")
+        live_error(con, inst, f"#{tid} OKX 平仓失败，下一轮重试（止损单仍在交易所上）：{e}")
+        if time.time() - _LIVE_ALERT_TS.get(tid, 0) >= 1800:       # 同一笔平仓失败最多 30 分钟推送一次
+            _LIVE_ALERT_TS[tid] = time.time()
+            alert(cfg, f"[{inst}] #{tid} OKX 平仓失败，程序每轮重试：{e}")
         return
     con.execute("update trades set live_status='closing', live_exit_ts=? where id=?", (now_ms(), tid)); con.commit()
     try:
@@ -397,12 +420,30 @@ def live_record(con, tid, inst):
 def live_reconcile(con, cfg, inst):
     """每轮对账：模拟已平而 OKX 未平 → 补平；OKX 已无持仓（止损单成交 / 人工平仓 / 强平）→ 补记真实结果。"""
     import okx_trade
-    for t in con.execute("select * from trades where inst=? and live_status in ('open', 'closing')", (inst,)).fetchall():
+    for t in con.execute("select * from trades where inst=? and live_status in ('opening', 'open', 'closing')", (inst,)).fetchall():
+        if t["live_status"] == "opening":           # 上次下单途中进程中断：以交易所持仓为准
+            pos = okx_trade.position(inst, _side(t))
+            if pos:
+                note = "下单途中程序中断，重启后按交易所持仓认领；" + okx_trade.ensure_stop(inst, _side(t), t["stop"], t["id"])
+                con.execute("update trades set live_status='open', live_sz=?, live_entry=?, live_note=? where id=?",
+                            (pos["sz"], pos["avgPx"], note[:300], t["id"])); con.commit()
+                signal(con, inst, pos["avgPx"], "实盘", f"#{t['id']} {note}")
+                t = con.execute("select * from trades where id=?", (t["id"],)).fetchone()
+            else:
+                con.execute("update trades set live_status='failed', live_note='下单途中程序中断，交易所上没有持仓' where id=?", (t["id"],))
+                con.commit()
+                continue
         if t["live_status"] == "open":
             if t["exit_ts"] is not None:
                 live_close(con, cfg, t["id"], inst)
                 continue
             if okx_trade.position(inst, _side(t)):
+                # 每 60 秒核对一次交易所上的止损单还在（例如在 App 里被误撤），不在就按原止损价补挂
+                if time.time() - _STOP_CHECK_TS.get(t["id"], 0) >= 60:
+                    _STOP_CHECK_TS[t["id"]] = time.time()
+                    note = okx_trade.ensure_stop(inst, _side(t), t["stop"], t["id"])
+                    if note:
+                        signal(con, inst, None, "实盘", f"#{t['id']} {note}")
                 continue
             con.execute("update trades set live_status='closing', live_exit_ts=? where id=?", (now_ms(), t["id"])); con.commit()
             signal(con, inst, None, "实盘", f"#{t['id']} OKX 上的持仓已平（止损单成交或人工平仓），模拟交易继续按自己的规则跟踪")
@@ -422,10 +463,12 @@ def live_error(con, inst, msg):
 
 
 _LIVE_ERR_TS = {}
+_LIVE_ALERT_TS = {}
+_STOP_CHECK_TS = {}
 
 
 def handle(con, cfg, inst, unit):
-    if cfg.get("_live"):
+    if cfg.get("_live_manage"):
         try:
             live_reconcile(con, cfg, inst)
         except Exception as e:
@@ -441,7 +484,7 @@ def handle(con, cfg, inst, unit):
             if (l <= t["stop"]) if long else (h >= t["stop"]):
                 net = close_trade(con, cfg, t, t["stop"], ts_ + 60_000, "止损")
                 signal(con, inst, price, "平仓", f"#{t['id']} 止损 {t['entry_px']:.6g}→{t['stop']:.6g} 净{net:+.2f}U")
-                if cfg.get("_live") and t["live_status"] == "open":
+                if cfg.get("_live_manage") and t["live_status"] == "open":
                     live_close(con, cfg, t["id"], inst)
                 return
             last = ts_ + 60_000
@@ -452,7 +495,7 @@ def handle(con, cfg, inst, unit):
         if opp:
             net = close_trade(con, cfg, t, price, now_ms(), f"反向{opp[0]}")
             signal(con, inst, price, "平仓", f"#{t['id']} 15m 出现{opp[0]}，按 {price:.6g} 离场 净{net:+.2f}U")
-            if cfg.get("_live") and t["live_status"] == "open":
+            if cfg.get("_live_manage") and t["live_status"] == "open":
                 live_close(con, cfg, t["id"], inst)
             return
         upnl = (price - t["entry_px"]) * (1 if long else -1) * t["qty"]
@@ -538,6 +581,8 @@ def run_once():
     prev = read_heartbeat()
     errors = []
     cfg["_live"], live_err = live_mode(cfg)
+    cfg["_live_manage"] = live_manage_mode(cfg)
+    _CFG["_live"] = cfg["_live"]
     if live_err:
         errors.append(live_err)
         if live_err not in _LIVE_WARNED:          # 同一个配置问题只写一次日志
@@ -608,7 +653,7 @@ def write_dashboard(con, cfg):
         except Exception:
             prices[i] = None
     money = lambda v: f'<span class="{"up" if v > 0 else "down" if v < 0 else ""}">{v:+.2f}</span>'
-    LIVE_ST = {"open": "持仓", "closing": "已平待补记", "failed": "下单失败"}
+    LIVE_ST = {"open": "持仓", "opening": "下单中", "closing": "已平待补记", "failed": "下单失败", "skipped": "超上限未下单"}
     def live_cell(t):
         st = t["live_status"]
         if not st:
