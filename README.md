@@ -78,13 +78,18 @@ python trader15.py report    # 胜率、利润、持仓、最近成交
 - **止损挂在交易所上**：市价开多时附带止损单（最新价触发、市价成交），程序断线或崩溃也会止损；成交后核对止损单确实挂上，没有就补挂，补挂失败立即平仓。
 - **离场**：策略反向离场或模拟止损时，市价全平并撤掉剩余止损单。交易所先止损时，模拟交易继续按自己的规则跟踪（两边独立统计）。
 - **对账**：每轮核对 OKX 持仓；平掉的仓位从仓位历史补记真实开平均价、手续费、资金费和净盈亏，看板上显示“OKX 实际净利”。
+- **仓位**：模拟交易固定每个品种约 2500U（与回测一致，便于对照）；OKX 默认按账户权益开仓，所以两边的盈亏金额不同，比较时看收益率。
 - **出错不影响模拟交易**：下单失败只记录并告警；下单请求返回异常但交易所其实已成交时，按交易所持仓接着跟踪。
 
 配置（`okx_api.json` + `trader15_config.json`）：
 
 1. 复制 `okx_api.example.json` 为 `okx_api.json`，填写带“交易”权限的 Key（不要勾提现，绑定服务器 IP 白名单）。模拟盘 Key 设 `"simulated": true`。
 2. 服务器上先自检：`python okx_live_check.py`（只读 + 设置逐仓杠杆）；模拟盘可再跑 `python okx_live_check.py roundtrip` 用最小数量走一遍开平仓。
-3. `trader15_config.json` 里设 `"live_trading": true`，按需调整 `live_leverage`（默认 3）、`live_size_factor`（下单数量 = 模拟仓位 × 该系数，默认 1），然后重启服务。
+3. `trader15_config.json` 里设 `"live_trading": true`，按需调整 `live_leverage`（默认 10）和仓位，然后重启服务。
+   - 仓位默认 `"live_sizing": "equity"`：每笔名义价值 = 开仓时 OKX 账户 USDT 权益 × `live_equity_frac`（默认 1，即每笔 1 倍）。
+     逐仓 10 倍时每笔保证金 = 权益 10%，8 个品种可以同时持仓，但合计名义价值最多到权益的 8 倍（每笔止损约亏权益的 0.9%）。
+     保证金不够时该笔跳过、记录原因（模拟交易照常）。
+   - `"live_sizing": "fixed"`：下单数量 = 模拟仓位 × `live_size_factor`（每个品种约 2500U 名义价值 × 系数）。
 4. **真实账户**（`simulated` 为 false）还必须把 `live_allow_real` 设为 `true`，否则安全锁生效、只做模拟。
 
 OKX 模拟盘没有 ZEC、HYPE 两个合约，模拟盘阶段这两个品种会记为“下单失败”，模拟交易照常。

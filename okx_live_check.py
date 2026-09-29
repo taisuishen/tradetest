@@ -24,14 +24,15 @@ def main():
     lt.check_account()
     b = lt.balance_usdt()
     print(f"USDT 权益 {b['eq']:.2f}，可用 {b['availBal']:.2f}")
-    lev = cfg["live_leverage"]; k = cfg["live_size_factor"]
+    lev = cfg["live_leverage"]; k = cfg["live_size_factor"]; frac = cfg.get("live_equity_frac", 1.0)
+    by_eq = cfg.get("live_sizing", "equity") == "equity"
     total = 0.0
-    print(f"\n逐仓 {lev} 倍，下单数量 = 模拟仓位 × {k:g}：")
+    print(f"\n逐仓 {lev} 倍，" + (f"每笔名义价值 = 权益 {b['eq']:,.0f}U × {frac:g}：" if by_eq else f"下单数量 = 模拟仓位 × {k:g}："))
     for inst, ic in cfg["instruments"].items():
         s = lt.spec(inst)
-        qty = ic["unit"] * k
-        n = lt.contracts(inst, qty)
         px = float(trader15.ox.ticker(inst)["last"])
+        qty = b["eq"] * frac / px if by_eq else ic["unit"] * k
+        n = lt.contracts(inst, qty)
         notional = float(n * s["ctVal"]) * px
         total += notional
         time.sleep(0.5)              # 设置杠杆接口限频较严，逐个慢慢设
@@ -40,9 +41,10 @@ def main():
         except Exception as e:
             lv = f"设置杠杆失败：{e}"
         print(f"  {inst:16s} {qty:g} 个币 → {lt.num(n)} 张（每张 {s['ctVal']}，最小 {s['minSz']}）≈ {notional:,.0f}U，保证金约 {notional / lev:,.0f}U｜{lv}")
-    print(f"\n全部品种同时持仓：名义 {total:,.0f}U，逐仓保证金约 {total / lev:,.0f}U（可用 {b['availBal']:,.0f}U）")
+    per = total / len(cfg["instruments"]) / lev
+    print(f"\n全部品种同时持仓：名义 {total:,.0f}U（权益的 {total / max(b['eq'], 1):.1f} 倍），逐仓保证金约 {total / lev:,.0f}U（可用 {b['availBal']:,.0f}U）")
     if total / lev > b["availBal"]:
-        print("  ⚠️ 可用余额不够所有品种同时开仓，满仓时后面的单子会因保证金不足失败")
+        print(f"  ⚠️ 可用余额最多够同时开 {int(b['availBal'] // per)} 笔，再开的单子会因保证金不足不下单（模拟交易照常）")
     if len(sys.argv) > 1 and sys.argv[1] == "roundtrip":
         if not c["simulated"]:
             print("\nroundtrip 只允许在模拟盘上运行（okx_api.json 里 simulated 需为 true），已拒绝"); return 1

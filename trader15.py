@@ -68,8 +68,10 @@ DEFAULT_CFG = {
     "alert_trades": False,      # 开仓 / 平仓时是否也推送
     # OKX 下单（见 okx_trade.py）：模拟交易照常运行并做决策，开启后每笔开平仓同步到 OKX；一律逐仓、只做多
     "live_trading": False,      # true：同步下单到 OKX（需 okx_api.json 里的交易权限 Key）
-    "live_leverage": 3,         # 逐仓杠杆
-    "live_size_factor": 1.0,    # OKX 下单数量 = 模拟仓位数量 × 该系数（1.0 即每个品种约 2500U 名义价值）
+    "live_leverage": 10,        # 逐仓杠杆（10 倍：强平约在开仓价下方 9.5%，回测里所有止损都在强平之前）
+    "live_sizing": "equity",    # equity：每笔名义价值 = 开仓时 OKX 账户 USDT 权益 × live_equity_frac；fixed：模拟仓位数量 × live_size_factor
+    "live_equity_frac": 1.0,    # equity 模式下每笔名义价值占权益的比例（1.0 = 每笔 1 倍，10 倍杠杆时每笔保证金 = 权益 10%；多个品种同时持仓时合计会超过 1 倍）
+    "live_size_factor": 1.0,    # fixed 模式：OKX 下单数量 = 模拟仓位数量 × 该系数（1.0 即每个品种约 2500U 名义价值）
     "live_allow_real": False,   # 安全锁：Key 不是模拟盘（okx_api.json 里 simulated 不为 true）时，必须设为 true 才会下真实订单
 }
 LONG = {"一买", "二买", "三买", "盘背买"}
@@ -272,11 +274,29 @@ def live_mode(cfg):
     return ("OKX 模拟盘" if c["simulated"] else "OKX 实盘"), None
 
 
+def live_qty(cfg, inst, qty):
+    """OKX 下单币数与说明。equity 模式按开仓时的账户权益算，并先检查可用保证金够不够（不够就不下单，说清楚原因）。"""
+    import okx_trade
+    if cfg.get("live_sizing", "equity") != "equity":
+        k = cfg.get("live_size_factor", 1.0)
+        return qty * k, f"模拟仓位 × {k:g}"
+    b = okx_trade.balance_usdt()
+    frac = cfg.get("live_equity_frac", 1.0)
+    px = float(ox.ticker(inst)["last"])
+    notional = b["eq"] * frac
+    need = notional / cfg.get("live_leverage", 10)
+    if need > b["availBal"]:
+        raise RuntimeError(f"可用保证金不足：按权益 {b['eq']:,.0f}U × {frac:g} 开 {notional:,.0f}U，逐仓 {cfg.get('live_leverage', 10)} 倍"
+                           f"需保证金 {need:,.0f}U，可用只有 {b['availBal']:,.0f}U（其他品种持仓占用了保证金）")
+    return notional / px, f"按权益 {b['eq']:,.0f}U × {frac:g} ≈ {notional:,.0f}U"
+
+
 def live_open(con, cfg, tid, inst, qty, stop):
     import okx_trade
-    lev = cfg.get("live_leverage", 3)
+    lev = cfg.get("live_leverage", 10)
     try:
-        r = okx_trade.open_long(inst, qty * cfg.get("live_size_factor", 1.0), stop, lev, tid)
+        q, size_note = live_qty(cfg, inst, qty)
+        r = okx_trade.open_long(inst, q, stop, lev, tid)
     except Exception as e:
         # 下单请求本身出错时，订单可能其实已成交：以交易所持仓为准，有持仓就接着跟踪并确认止损单
         try:
@@ -295,7 +315,7 @@ def live_open(con, cfg, tid, inst, qty, stop):
         return
     con.execute("update trades set live_status='open', live_sz=?, live_entry=?, live_fee=?, live_note=? where id=?",
                 (r["sz"], r["avgPx"], r["fee"], r.get("note"), tid)); con.commit()
-    signal(con, inst, r["avgPx"], "实盘", f"#{tid} {cfg['_live']}逐仓 {lev} 倍开多 {r['sz']:g} 张 @{r['avgPx']:.6g}，"
+    signal(con, inst, r["avgPx"], "实盘", f"#{tid} {cfg['_live']}逐仓 {lev} 倍开多 {r['sz']:g} 张（{size_note}）@{r['avgPx']:.6g}，"
                                          f"止损单 {r['stop']:.6g}" + (f"；{r['note']}" if r.get("note") else ""))
 
 
@@ -544,7 +564,10 @@ def write_dashboard(con, cfg):
     lv = con.execute("select count(*) n, coalesce(sum(live_net), 0) net, coalesce(sum(live_fee), 0) fee, "
                      "coalesce(sum(live_net > 0), 0) w from trades where live_status='closed' and live_net is not null").fetchone()
     live_now = cfg.get("_live")
-    live_desc = (f"{live_now}同步下单（逐仓 {cfg.get('live_leverage', 3)} 倍，数量 × {cfg.get('live_size_factor', 1.0):g}）"
+    lev_, frac_ = cfg.get("live_leverage", 10), cfg.get("live_equity_frac", 1.0)
+    live_size = (f"每笔名义 = 权益 × {frac_:g}，保证金 = 权益 {frac_ / lev_:.0%}" if cfg.get("live_sizing", "equity") == "equity"
+                 else f"数量 = 模拟仓位 × {cfg.get('live_size_factor', 1.0):g}")
+    live_desc = (f"{live_now}同步下单（逐仓 {lev_} 倍，{live_size}）"
                  if live_now else "只模拟，不下真实单")
     pts = [0.0] + s["curve"]
     if len(pts) > 1:

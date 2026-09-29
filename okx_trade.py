@@ -120,6 +120,7 @@ def spec(inst):
     if inst not in sp:
         d = ox.instrument(inst)
         sp[inst] = {k: Decimal(d[k]) for k in ("ctVal", "lotSz", "minSz", "tickSz")}
+        sp[inst]["maxMktSz"] = Decimal(d.get("maxMktSz") or "1e12")      # 单张市价单最多多少张
     return sp[inst]
 
 
@@ -208,6 +209,9 @@ def open_long(inst, qty, stop_px, lever, tid):
     if not sz:
         s = spec(inst)
         raise OkxError(f"{inst} 下单数量 {qty} 个币不足最小 {s['minSz']} 张（每张 {s['ctVal']}）")
+    capped = sz > spec(inst)["maxMktSz"]
+    if capped:
+        sz = spec(inst)["maxMktSz"]
     ensure_leverage(inst, lever)
     stop = price_str(inst, stop_px)
     cl = _cl_id("t15o", tid)
@@ -221,6 +225,8 @@ def open_long(inst, qty, stop_px, lever, tid):
     res = {"sz": float(o["accFillSz"]), "avgPx": float(o["avgPx"]), "fee": -float(o.get("fee") or 0), "ordId": r["ordId"], "stop": float(stop)}
     time.sleep(0.5)
     note = ensure_stop(inst, stop_px, tid)
+    if capped:
+        note = (note + f"；数量超过单笔市价单上限，按上限 {num(sz)} 张下单").lstrip("；")
     pos = position(inst)
     if pos and pos["liqPx"] and pos["liqPx"] >= float(stop):
         note = (note + f"；警告：强平价 {pos['liqPx']} 不低于止损价 {stop}").lstrip("；")
