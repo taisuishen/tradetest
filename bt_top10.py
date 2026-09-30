@@ -502,7 +502,7 @@ def v5_eth(days):
     import chan15_lab2 as L
     data = {INST: L.load(days, ((INST, 1.0),), "_eth")[INST]}
     data = B.attach(data, B.features(data, days))
-    t = L.simulate(data[INST], {"sigs": bt_v5.V["v5（两者都加，当前实盘）"]})
+    t = L.simulate(data[INST], {"sigs": bt_v5.V["v5（两者都加）"]})
     t["ret"] = t.net / (t.entry * t.mult)
     return t.rename(columns={"ts": "entry_ts"})
 

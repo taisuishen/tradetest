@@ -275,6 +275,10 @@ def simulate(d, v, t_from=None, t_to=None, step=M15):
                 dc, de = pv["daily_exit"][T]
                 if (dc - de) * pos["side"] < 0:
                     close(info["close"], T, "日线跌破EMA", fm["taker"]); pos = None
+            if pos and pv.get("tunnel_exit") and info.get("vt"):         # v6：15m 收盘跌破维加斯隧道下沿（空单：升破上沿），见 bt_v5.attach_vt
+                lo, hi = info["vt"]
+                if (info["close"] < lo) if pos["side"] > 0 else (info["close"] > hi):
+                    close(info["close"], T, "跌破隧道下沿" if pos["side"] > 0 else "升破隧道上沿", fm["taker"]); pos = None
             if pos and pv.get("tt_exit") is not None and info.get("tt") and info["tt"]["1H"]["score"] * pos["side"] < pv["tt_exit"]:
                 close(info["close"], T, "转向", fm["taker"]); pos = None      # TradeTrack 1H 评分转向（见 bt_ttrack.py）
             if pos and pv.get("max_bars") and pos["bars"] >= pv["max_bars"]:

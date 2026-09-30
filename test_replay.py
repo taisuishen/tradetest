@@ -5,7 +5,7 @@
   - 手续费吃单 0.05%；下单保证金不够就拒单（51008）
 可注入故障（--faults）：下单成交后网络断开、平仓失败、仓位历史延迟出现、下单途中进程被杀（随后“重启”）
 每一轮检查不变量：交易所每个持仓都有止损单；交易所持仓与数据库 live 记录一一对应；没有孤儿仓位。
-最后与回测（chan15_lab2 v5）逐笔比较开仓。
+最后与回测（chan15_lab2，bt_v5.LIVE 即当前实盘规则）逐笔比较开仓和离场。
 
 用法：python test_replay.py [天数=30] [--faults [--crash 0.03] [--seed 1]] [--no-compare]
       需要先有本地 K 线缓存（kcache，1m / 15m / 1H / 4H）
@@ -256,7 +256,7 @@ def main():
             tr.run_once()
         except Crash:
             crashes += 1                                    # “重启”：进程内缓存全部清空
-            lt._STATE.clear(); tr._LIVE_ERR_TS.clear(); tr._LIVE_ALERT_TS.clear(); tr._STOP_CHECK_TS.clear()
+            lt._STATE.clear(); tr._LIVE_ERR_TS.clear(); tr._LIVE_ALERT_TS.clear(); tr._STOP_CHECK_TS.clear(); tr._TUNNEL_TS.clear()
         con = tr.db()
         live = {r["inst"]: r for r in con.execute("select * from trades where live_status in ('open', 'opening')")}
         for inst, p in ex.pos.items():
@@ -293,17 +293,18 @@ def main():
 
 
 def compare_backtest(df, start, end):
-    """与回测（bt_v5 的 v5 规则，5m K 线撮合）逐笔比较开仓：同一合约、开仓时间相差 15 分钟以内算一致。"""
+    """与回测（bt_v5.LIVE 当前实盘规则，5m K 线撮合）逐笔比较：同一合约、开仓时间相差 15 分钟以内算同一笔；
+    同一笔再比较离场：离场原因同类、离场时间相差 15 分钟以内算一致。"""
     import bt_ttrack as B
     import bt_v5
     import chan15_lab2 as L
     insts = L.live_insts()
     data = {i: d for i, d in L.load(180, insts, "_live").items() if i in dict(insts)}
-    data = B.attach(data, B.features(data, 180))
+    data = bt_v5.attach_vt(B.attach(data, B.features(data, 180)))
     bt_end = min(d[1][-1] for d in data.values())
     rows = []
     for i, d in data.items():
-        t = L.simulate(d, {"sigs": bt_v5.V["v5（两者都加，当前实盘）"]}, t_from=start)
+        t = L.simulate(d, {"sigs": bt_v5.LIVE}, t_from=start)
         if len(t):
             rows.append(t.assign(inst=i))
     bt = pd.concat(rows)
@@ -316,6 +317,21 @@ def compare_backtest(df, start, end):
                if not any((bt.inst == r.inst) & (bt.ts - r.entry_ts).abs().le(M15))]
     print(f"\n== 与回测逐笔比较（{len(bt)} 笔回测 / {len(rp)} 笔回放）==\n一致 {both} 笔；只在回测里 {len(only_bt)} 笔 {only_bt[:10]}；"
           f"只在回放里 {len(only_rp)} 笔 {only_rp[:10]}")
+    kind = lambda w: "止损" if w in ("止损", "保本") else "隧道" if "隧道" in str(w) else "反向" if str(w).startswith("反向") else str(w)
+    same, diff = 0, []
+    for r in bt.itertuples():
+        m = rp[(rp.inst == r.inst) & (rp.entry_ts - r.ts).abs().le(M15) & rp.exit_ts.notna()]
+        if not len(m):
+            continue
+        x = m.iloc[0]
+        if kind(x.exit_reason) == kind(r.why) and abs(x.exit_ts - r.end) <= M15:
+            same += 1
+        else:
+            diff.append(f"{r.inst[:4]} {pd.Timestamp(r.ts, unit='ms', tz='UTC').tz_convert('Asia/Shanghai'):%m-%d %H:%M} "
+                        f"回测 {r.why}@{pd.Timestamp(r.end, unit='ms', tz='UTC').tz_convert('Asia/Shanghai'):%m-%d %H:%M} / "
+                        f"回放 {x.exit_reason}@{pd.Timestamp(x.exit_ts, unit='ms', tz='UTC').tz_convert('Asia/Shanghai'):%m-%d %H:%M}")
+    print(f"离场一致 {same} 笔，不一致 {len(diff)} 笔" + "".join("\n  " + d for d in diff[:10]))
+    print("回测离场原因：", bt.why.map(kind).value_counts().to_dict(), "｜回放离场原因：", rp.exit_reason.dropna().map(kind).value_counts().to_dict())
 
 
 if __name__ == "__main__":

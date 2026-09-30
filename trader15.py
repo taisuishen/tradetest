@@ -1,7 +1,7 @@
 """
 15 分钟级缠论单仓交易（默认只模拟；live_trading=true 时同步下单到 OKX）。
 
-规则 v5（chan15_lab2.py 控制变量测试 + bt_v5.py 两段回测：8 个品种、窄中枢、只做多、不追高、低效率信号需指标确认）：
+规则 v6（chan15_lab2.py 控制变量测试 + bt_v5.py 两段回测：8 个品种、窄中枢、只做多、不追高、低效率信号需指标确认、维加斯隧道离场）：
   品种：ETH / BTC / SOL / XRP / DOGE / SUI / ZEC / HYPE，每个品种各自一个仓位，1 倍 ≈ 2500U 名义价值
   入场：15m 新确认的三买做多，按当前价成交（不计滑点），不加仓；不做空
         （2025 全年样本外回测：空单 145 笔全年 −34%，连 BTC −17% 的 11 月也亏；只做多 +83% / 回撤 24.8%。
@@ -17,7 +17,9 @@
         （v5 两段回测，每笔名义 = 权益 × 1 复利：最近 180 天 v4 +141% / 回撤 17% → +277% / 15%；
           2025 全年 +83% / 25% → +115% / 17%）
   止损：买卖点价格外 0.5 ATR(15m)；用 1 分钟 K 线高低点逐根判定，按止损价原价成交
-  离场：止损，或持仓中 15m 出现反向买卖点（按当时价格平仓）；不设固定止盈
+  离场：止损；或持仓中 15m 出现反向买卖点；或 15m 收盘跌破维加斯隧道下沿 min(EMA144, EMA169)（v6 新增，空单为升破上沿），
+        先到先走，按当时价格平仓；不设固定止盈
+        （v6：v5 + 隧道离场，两段回测最近 180 天 +277% → +280%、回撤 15% → 16%；2025 全年 +115% → +125%、回撤 17% 不变）
   费用：交易手续费 = 成交金额 × OKX 吃单费率（开平各一次；配置只读 API Key 时用账户真实费率，否则 Lv1 标准 0.05%），
         另加持仓期间 OKX 实际资金费（fees.py）；fee_mode=fixed 可改回每 1 倍固定 2U
   OKX 下单（可选，live_trading=true）：照着模拟交易同步开平仓，一律逐仓、开仓时附带交易所止损单，每轮对账（okx_trade.py）
@@ -50,7 +52,7 @@ import notify  # noqa: E402
 
 TZ = timezone(timedelta(hours=8))
 CFG_PATH = ROOT / "trader15_config.json"
-STRATEGY_VERSION = 5
+STRATEGY_VERSION = 6
 DEFAULT_CFG = {
     "strategy_version": STRATEGY_VERSION,
     # 1 倍 ≈ 2500U 名义价值（按 2026-09 价格折算）
@@ -69,6 +71,7 @@ DEFAULT_CFG = {
     "weak_tt_4h": 20,          # 低效率信号要求 TradeTrack 4H 评分
     "max_chase_atr": 1.75,     # 现价离买卖点超过几倍 ATR(15m) 就不追，0 表示不限
     "max_zs_width_atr": 1.5,   # 15m 最近中枢宽度上限（倍 ATR），0 表示不过滤
+    "exit_vegas_tunnel": True,  # v6：持仓中 15m 收盘跌破维加斯隧道下沿 min(EMA144, EMA169) 就离场（空单：升破上沿）
     "loop_interval_sec": 1,    # 常驻模式两轮之间的最短间隔（秒），0 表示算完马上接着算
     "sizing": "",              # 动态仓位：step=按评分分档 0.5/1/2/3/5 倍，linear=0.5~5 倍线性，""=固定 1 倍（见 sizing.py）
     "stop_buffer_atr": 0.5,
@@ -112,8 +115,8 @@ STRATEGY_KEYS = ("instruments", "entry_points", "min_trend_eff_1h", "max_zs_widt
 
 def migrate_cfg(raw):
     """旧版配置升级到当前策略，先备份旧配置。
-    v1 → 当前：覆盖全部策略项（v1 与之后的规则差别很大）。v2 / v3 / v4 → 当前：只改入场点（v4 起只做多）；
-    v5 新增的设置项（weak_* / max_chase_atr）由 load_cfg 自动补上默认值。
+    v1 → 当前：覆盖全部策略项（v1 与之后的规则差别很大）。v2 ~ v5 → 当前：只改入场点（v4 起只做多）；
+    v5 / v6 新增的设置项（weak_* / max_chase_atr / exit_vegas_tunnel）由 load_cfg 自动补上默认值。
     已平仓记录归档到 trader15_v{旧版本}.db，新策略从零开始统计；未平仓位（含 OKX 上在跟踪的）带到新库继续管理。"""
     user = json.loads(raw)
     old = user.get("strategy_version", 1)
@@ -502,6 +505,39 @@ def live_error(con, inst, msg):
 _LIVE_ERR_TS = {}
 _LIVE_ALERT_TS = {}
 _STOP_CHECK_TS = {}
+_TUNNEL_TS = {}
+M15 = 900_000
+
+
+def vegas_tunnel(inst, n=1000):
+    """15m 维加斯隧道：最近一根已收盘 K 线的 (开盘时刻, 收盘价, 下沿, 上沿)，下沿 / 上沿 = min / max(EMA144, EMA169)。
+    取 1000 根算 EMA，初值的影响不到十万分之一，和回测（用全部历史）一致。"""
+    d = ox.candles(inst, "15m", n)
+    if len(d) < 400:
+        return None
+    a = d.c.ewm(span=144, adjust=False).mean().iloc[-1]
+    b = d.c.ewm(span=169, adjust=False).mean().iloc[-1]
+    return int(d.ts.iloc[-1]), float(d.c.iloc[-1]), float(min(a, b)), float(max(a, b))
+
+
+def tunnel_exit(cfg, t, df15):
+    """v6 离场：开仓之后收盘的每根 15m 检查一次，多单收盘价 < 隧道下沿（空单 > 上沿）返回离场原因，否则 None。
+    每根 15m 只拉一次 1000 根 K 线（按 K 线时刻去重）。"""
+    if not cfg.get("exit_vegas_tunnel") or not len(df15):
+        return None
+    bar = int(df15.ts.iloc[-1])
+    if bar + M15 <= t["entry_ts"] or _TUNNEL_TS.get(t["id"]) == bar:
+        return None
+    vt = vegas_tunnel(t["inst"])
+    if not vt or vt[0] + M15 <= t["entry_ts"]:
+        return None
+    _TUNNEL_TS[t["id"]] = vt[0]
+    _, c, lo, hi = vt
+    if t["side"] == "long" and c < lo:
+        return f"15m 收盘 {c:.6g} 跌破维加斯隧道下沿 {lo:.6g}"
+    if t["side"] == "short" and c > hi:
+        return f"15m 收盘 {c:.6g} 升破维加斯隧道上沿 {hi:.6g}"
+    return None
 
 
 def handle(con, cfg, inst, unit):
@@ -534,6 +570,15 @@ def handle(con, cfg, inst, unit):
             net = close_trade(con, cfg, t, price, now_ms(), f"反向{opp[0]}")
             signal(con, inst, price, "平仓", f"#{t['id']} 15m 出现{opp[0]}，按 {price:.6g} 离场 净{net:+.2f}U",
                    notify.close_card(t["id"], inst, 1 if long else -1, f"15m 出现{opp[0]}（反向离场）", t["entry_px"], price, net,
+                                     t["entry_ts"], now_ms()))
+            if cfg.get("_live_manage") and t["live_status"] == "open":
+                live_close(con, cfg, t["id"], inst)
+            return
+        why = tunnel_exit(cfg, t, df15)                           # 3) v6：15m 收盘跌破维加斯隧道下沿
+        if why:
+            net = close_trade(con, cfg, t, price, now_ms(), "跌破隧道下沿" if long else "升破隧道上沿")
+            signal(con, inst, price, "平仓", f"#{t['id']} {why}，按 {price:.6g} 离场 净{net:+.2f}U",
+                   notify.close_card(t["id"], inst, 1 if long else -1, f"{why}（隧道离场）", t["entry_px"], price, net,
                                      t["entry_ts"], now_ms()))
             if cfg.get("_live_manage") and t["live_status"] == "open":
                 live_close(con, cfg, t["id"], inst)
@@ -783,7 +828,7 @@ td.d{{white-space:normal;min-width:260px;color:var(--sub)}}
 </style></head><body>
 <h1>15 分钟级缠论模拟交易</h1>
 {health}
-<div class="muted">{live_desc}｜策略 v{cfg.get('strategy_version', 1)}｜{len(cfg['instruments'])} 个品种｜15m {' / '.join(cfg['entry_points'])}入场，区间套（1H 缠论）+ 大方向 + 只做趋势（1H 趋势效率≥{cfg['min_trend_eff_1h']:.0%}）{zs_desc}｜{size_desc}｜止损在买卖点外 0.5 ATR，反向买卖点离场｜
+<div class="muted">{live_desc}｜策略 v{cfg.get('strategy_version', 1)}｜{len(cfg['instruments'])} 个品种｜15m {' / '.join(cfg['entry_points'])}入场，区间套（1H 缠论）+ 大方向 + 只做趋势（1H 趋势效率≥{cfg['min_trend_eff_1h']:.0%}）{zs_desc}｜{size_desc}｜止损在买卖点外 0.5 ATR，反向买卖点{'或 15m 收盘跌破维加斯隧道下沿' if cfg.get('exit_vegas_tunnel') else ''}离场｜
 {fee_desc}，不计滑点｜常驻循环实时扫描｜开始于 {bj(first)}｜更新于 {datetime.now(TZ):%m-%d %H:%M:%S}</div>
 {live_bal}
 <div class="grid">

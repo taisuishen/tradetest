@@ -89,7 +89,7 @@ def build(base, feats, inst, tf, t0, t1):
 def stat(data, tf, days):
     rows = []
     for inst, d in data.items():
-        t = L.simulate(d, {"sigs": V5.V["v5（两者都加，当前实盘）"]}, step=MS[tf])
+        t = L.simulate(d, {"sigs": V5.V["v5（两者都加）"]}, step=MS[tf])
         if len(t):
             t["ret"] = t.net / (t.entry * d[0] * t.mult); t["fee_ret"] = t.fee / (t.entry * d[0] * t.mult); rows.append(t)
     df = pd.concat(rows).sort_values("ts").reset_index(drop=True)
