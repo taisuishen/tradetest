@@ -266,6 +266,10 @@ def simulate(d, v, t_from=None, t_to=None):
                 opp = next((t for t, ts_, _ in info["fresh"] if t in want and ts_ > pos["point_ts"] and ts_ >= pos["ts"] - 45 * 60_000), None)
                 if opp:
                     close(info["close"], T, "反向" + opp, fm["taker"]); pos = None
+            if pos and pv.get("daily_exit") and T in pv["daily_exit"]:          # 日线收盘跌破 EMA 离场（Christian 式，见 bt_v5_christian.py）
+                dc, de = pv["daily_exit"][T]
+                if (dc - de) * pos["side"] < 0:
+                    close(info["close"], T, "日线跌破EMA", fm["taker"]); pos = None
             if pos and pv.get("tt_exit") is not None and info.get("tt") and info["tt"]["1H"]["score"] * pos["side"] < pv["tt_exit"]:
                 close(info["close"], T, "转向", fm["taker"]); pos = None      # TradeTrack 1H 评分转向（见 bt_ttrack.py）
             if pos and pv.get("max_bars") and pos["bars"] >= pv["max_bars"]:

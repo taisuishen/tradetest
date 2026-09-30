@@ -124,11 +124,12 @@ def stats(tr, days):
 
 
 # ---------------- 各方法 ----------------
-def m10_christian(D, H1, m5, start):
+def m10_christian(D, H1, m5, start, blocked=()):
     """第 10 位 Christian（Qullamaggie）突破：
     ① 整理前 1~3 个月涨幅 30%~100%；② 整理 2 周~2 个月（10~40 根日线），低点抬高、区间收窄；
     ③ 1 小时收盘突破整理区高点就买；④ 止损在当日最低价，且不超过 1 倍日线 ATR（超过就按 1 倍 ATR）；
-    ⑤ 第 5 天收盘平 1/3、止损移到开仓价；日线收盘跌破 EMA10 再平 1/3，跌破 EMA20 平剩下的。"""
+    ⑤ 第 5 天收盘平 1/3、止损移到开仓价；日线收盘跌破 EMA10 再平 1/3，跌破 EMA20 平剩下的。
+    blocked：[(开始, 结束)] 这些时段内不开新仓（和其他模块共用一个品种仓位时用）。"""
     D = D.copy(); D["atr"] = atr(D); D["e10"], D["e20"], D["e50"] = ema(D.c, 10), ema(D.c, 20), ema(D.c, 50)
     b = Book(m5)
     for i in range(80, len(D)):
@@ -166,6 +167,8 @@ def m10_christian(D, H1, m5, start):
         hs = H1[(H1.ts >= day.ts) & (H1.ts < day.end)]
         for _, bar in hs.iterrows():                    # 当天 1 小时收盘突破整理区高点
             if bar.c > base:
+                if any(a0 <= int(bar.end) < a1 for a0, a1 in blocked):
+                    break                                # 这个品种正被别的模块占着
                 day_low = hs[hs.ts <= bar.ts].l.min()
                 stop = max(day_low, bar.c - D.iloc[i - 1].atr)
                 b.open(int(bar.end), bar.c, 1, stop, tag="突破", days=0)
