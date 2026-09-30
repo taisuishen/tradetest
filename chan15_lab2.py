@@ -222,7 +222,7 @@ SIGS = {"trend": sig_trend, "fade3": sig_fade3, "revert": sig_revert, "bc": sig_
 
 
 # ---------------- 撮合 ----------------
-def simulate(d, v, t_from=None, t_to=None):
+def simulate(d, v, t_from=None, t_to=None, step=M15):
     """v["sigs"]：按顺序尝试的信号模块列表 [(名字, 参数)]。通用离场参数放在各模块参数里：
     tp_rr 固定止盈倍数；be_r 浮盈几 R 后止损移到保本；opp 反向买卖点离场；max_bars 持仓超过多少根 15m 就平；
     trail_atr 按最高 / 最低价回撤几倍 ATR 跟踪止损；mult 固定倍数。"""
@@ -277,7 +277,7 @@ def simulate(d, v, t_from=None, t_to=None):
         # 2) 找新信号
         if pos is None and pend is None:
             for mod, pv in v["sigs"]:
-                if pv.get("cooldown") and T - last_stop.get(mod, -1e18) < pv["cooldown"] * M15:
+                if pv.get("cooldown") and T - last_stop.get(mod, -1e18) < pv["cooldown"] * step:
                     SIGS[mod](info, hr, {**pv, "eff_min": 9}, used.setdefault(mod, set()))   # 冷却期内的信号作废
                     continue
                 o = SIGS[mod](info, hr, pv, used.setdefault(mod, set()))
@@ -292,7 +292,7 @@ def simulate(d, v, t_from=None, t_to=None):
         while j < len(b5) and b5[j][0] < T:
             j += 1
         k = j
-        while k < len(b5) and b5[k][0] < T + M15 and (pos or pend):
+        while k < len(b5) and b5[k][0] < T + step and (pos or pend):      # step：信号周期（默认 15 分钟，见 bt_tf.py）
             ts_, h, l, c = b5[k]
             if pend:
                 s = pend["side"]
