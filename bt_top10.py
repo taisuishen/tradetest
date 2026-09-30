@@ -23,8 +23,8 @@ MS = {"5m": 300_000, "15m": 900_000, "1H": 3_600_000, "4H": 14_400_000, "1D": 86
 
 
 # ---------------- 数据与指标 ----------------
-def load(bar):
-    h = pickle.load(gzip.open(CACHE / f"{INST}_{bar}.pkl.gz", "rb"))
+def load(bar, inst=INST):
+    h = pickle.load(gzip.open(CACHE / f"{inst}_{bar}.pkl.gz", "rb"))
     ts = sorted(h)
     d = pd.DataFrame([h[t][:6] for t in ts], columns=["ts", "o", "h", "l", "c", "v"])
     d["end"] = d.ts + MS[bar]                      # 收盘时刻
