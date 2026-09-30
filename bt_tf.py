@@ -1,11 +1,11 @@
 """
-v5 换信号周期的对比（控制变量：只改缠论信号所在的周期，其余规则照 v5）：15m（现在）/ 5m / 1m。
+v5 换信号周期的对比（控制变量：只改缠论信号所在的周期，其余规则照 v5）：1m / 5m / 15m（现在）/ 30m / 1H。
 - 1H / 4H 的大方向、区间套、1H 趋势效率、TradeTrack 1H / 4H 确认都不变（复用 15m 版本算好的）；
 - 中枢宽度、不追高、止损缓冲都按信号周期自己的 ATR（和 v5 在 15m 上的做法一致）；“新”买卖点 = 最近 3 根信号 K 线内确认；
 - 撮合：15m / 5m 信号用 5 分钟 K 线判定止损，1m 信号用 1 分钟 K 线；每笔名义 = 权益 × 1 复利，吃单 0.05%，不计滑点。
-区间：15m / 5m 比较最近 180 天；1m 数据量大，只比较最近 30 天（三者同一段）。
+区间：默认比较最近 180 天和 2025 全年；1m 数据量大，只比较最近 30 天。
 
-用法：python bt_tf.py
+用法：python bt_tf.py [周期 …]          例如 python bt_tf.py 15m 30m 1H（默认）；python bt_tf.py 15m 5m 1m
 """
 import gzip
 import os
@@ -22,7 +22,7 @@ import bt_v5 as V5
 import chan15_lab2 as L
 
 L.SIGS["weak"] = L.sig_trend
-MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000}
+MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1H": 3_600_000}
 M15, D = L.M15, L.D
 _G = {}
 
@@ -107,16 +107,20 @@ def stat(data, tf, days):
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8"); pd.set_option("display.width", 260); pd.set_option("display.unicode.east_asian_width", True)
-    insts = L.live_insts()
-    base = {i: d for i, d in L.load(180, insts, "_live").items() if i in dict(insts)}
-    feats = B.features(base, 180)
-    t1 = min(d[1][-1] for d in base.values())
-    for days, tfs in ((180, ("15m", "5m")), (30, ("15m", "5m", "1m"))):
-        t0 = t1 - days * D
+    tfs = sys.argv[1:] or ["15m", "30m", "1H"]
+    all_insts = L.live_insts()
+    periods = [("最近 30 天", 30, None, set())] if "1m" in tfs else \
+              [("最近 180 天", 180, None, set()), ("2025 全年", 365, V5.END25, {"ZEC-USDT-SWAP", "HYPE-USDT-SWAP"})]
+    for pname, days, end, skip in periods:
+        insts = tuple(x for x in all_insts if x[0] not in skip)
+        load_days = 180 if days == 30 else days
+        base = {i: d for i, d in L.load(load_days, insts, "_live", end).items() if i in dict(insts)}
+        feats = B.features(base, load_days, end)
+        t1 = min(d[1][-1] for d in base.values()); t0 = t1 - days * D
         res = {}
         for tf in tfs:
             t = time.time()
             data = {i: build(base, feats, i, tf, t0, t1) for i in base}
             res[f"{tf} 信号"] = stat(data, tf, days)
-            print(f"  {days} 天 {tf}：{res[f'{tf} 信号']['笔数']} 笔（{time.time() - t:.0f}s）", flush=True)
-        print(f"\n== 最近 {days} 天（{len(base)} 个品种）==\n" + pd.DataFrame(res).T.to_string(), flush=True)
+            print(f"  {pname} {tf}：{res[f'{tf} 信号']['笔数']} 笔（{time.time() - t:.0f}s）", flush=True)
+        print(f"\n== {pname}（{len(base)} 个品种）==\n" + pd.DataFrame(res).T.to_string(), flush=True)
