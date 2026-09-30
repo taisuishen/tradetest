@@ -156,6 +156,11 @@ def sig_trend(info, hr, v, used):
             o["mult"] = sizing.size_from_score(sizing.strength(hr["trend"], hr["eff1h"], hr["trend1h_chan"], hr["adx4h"], side), v["sizing"])
         if v.get("entry") == "limit":          # 挂单等回踩到买卖点附近，而不是追价
             o.update(kind="limit", px=px + side * v.get("limit_atr", 0.2) * info["atr"], expire=v.get("limit_bars", 4))
+        if v.get("entry") == "dip":            # 挂单在信号收盘价下方 dip_atr 倍 ATR 等回落（见 bt_v5_opt.py）
+            lim = info["close"] - side * v.get("dip_atr", 0.3) * info["atr"]
+            if (lim - stop) * side <= 0:
+                continue
+            o.update(kind="limit", px=lim, expire=v.get("limit_bars", 4))
         return o
     return None
 
@@ -274,6 +279,17 @@ def simulate(d, v, t_from=None, t_to=None, step=M15):
                 close(info["close"], T, "转向", fm["taker"]); pos = None      # TradeTrack 1H 评分转向（见 bt_ttrack.py）
             if pos and pv.get("max_bars") and pos["bars"] >= pv["max_bars"]:
                 close(info["close"], T, "超时", fm["taker"]); pos = None
+            if pos and pv.get("exit_fn"):          # 通用离场钩子：("close", 原因) 全平；("part", 比例) 先平一部分并移到保本（见 bt_v5_opt.py）
+                act = pv["exit_fn"](info, pos, T)
+                if act and act[0] == "close":
+                    close(info["close"], T, act[1], fm["taker"]); pos = None
+                elif act and act[0] == "part" and not pos.get("part"):
+                    f, q, px_ = act[1], unit * pos["mult"], info["close"]
+                    pos["realized"] = pos.get("realized", 0.0) + (px_ - pos["entry"]) * pos["side"] * q * f
+                    pos["part_fee"] = pos.get("part_fee", 0.0) + px_ * q * f * fm["taker"]
+                    pos["rem"] = pos.get("rem", 1.0) - f; pos["part"] = True
+                    be = pos["entry"] * (1 + pos["side"] * 0.0012)
+                    pos["stop"] = max(pos["stop"], be) if pos["side"] > 0 else min(pos["stop"], be); pos["be"] = True
         # 2) 找新信号
         if pos is None and pend is None:
             for mod, pv in v["sigs"]:
